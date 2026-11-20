@@ -1,0 +1,65 @@
+# Fichier à créer sur GitHub sous le nom : .github/workflows/bilan.yml
+# Lance l'agent le mardi et le vendredi, envoie le mail et met à jour la page « appli ».
+
+name: Bilan Betclic
+
+on:
+  schedule:
+    - cron: "0 8 * * 2,5"   # mardi et vendredi, 8 h UTC = 9 h à Paris en hiver, 10 h en été
+  workflow_dispatch:         # bouton « Run workflow » pour lancer à la main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bilan
+  cancel-in-progress: false
+
+jobs:
+  bilan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploiement.outputs.page_url }}
+    steps:
+      - name: Récupérer les fichiers
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les bibliothèques
+        run: pip install -r requirements.txt
+
+      - name: Reprendre le cache (historiques, archive des cotes)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: cache-${{ github.run_id }}
+          restore-keys: cache-
+
+      - name: Lancer l'agent
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          BANKROLL: ${{ vars.BANKROLL }}
+          EDGE_MIN: ${{ vars.EDGE_MIN }}
+          PAGE_DIR: site
+        run: python agent_betclic.py
+
+      - name: Préparer la page téléphone
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Publier la page téléphone
+        id: deploiement
+        uses: actions/deploy-pages@v4
