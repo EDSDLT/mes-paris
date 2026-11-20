@@ -59,6 +59,7 @@ GEMINI_MODELS = [m.strip() for m in os.environ.get(
 ).split(",") if m.strip()]
 
 TZ = ZoneInfo("Europe/Paris")
+LIGNES_BUTS = (1.5, 2.5, 3.5)                            # lignes de buts conseillées pour chaque match
 COTE_MIN = 1.15                                          # aucune sélection sous cette cote
 EDGE_MIN = float((os.environ.get("EDGE_MIN") or "0.03").replace(",", "."))     # value minimale : +3 %
 EDGE_SUSPECT = 0.15                                      # au-delà : erreur probable, pas une aubaine
@@ -72,15 +73,28 @@ ACTUS_MAX_MATCHS = 12          # actus cherchées seulement pour les matchs qui 
 ACTUS_BUDGET_S = 150           # temps maximum consacré aux recherches web
 
 COMPETITIONS = [
-    {"id": "soccer_epl", "nom": "Premier League", "cat": "FOOT", "div": "E0", "us": "EPL"},
-    {"id": "soccer_spain_la_liga", "nom": "La Liga", "cat": "FOOT", "div": "SP1", "us": "La_Liga"},
-    {"id": "soccer_germany_bundesliga", "nom": "Bundesliga", "cat": "FOOT", "div": "D1", "us": "Bundesliga"},
-    {"id": "soccer_france_ligue_one", "nom": "Ligue 1 (PSG & Lens)", "cat": "FOOT", "div": "F1",
-     "us": "Ligue_1", "filtre": ["Paris", "Lens"]},
-    {"id": "soccer_uefa_champs_league", "nom": "Ligue des Champions", "cat": "FOOT", "div": None},
+    # "equipes" : clubs toujours retenus ; "top_n" : ajoute aussi les clubs classés dans le top N actuel ;
+    # "plus_meilleurs" : ajoute les N clubs les mieux classés qui ne sont pas déjà dans "equipes".
+    # Un match n'est analysé que s'il implique au moins un club retenu.
+    {"id": "soccer_epl", "nom": "Premier League", "cat": "FOOT", "div": "E0", "us": "EPL",
+     "equipes": ["Man City", "Arsenal", "Liverpool", "Chelsea", "Tottenham", "Man United"], "top_n": 4},
+    {"id": "soccer_spain_la_liga", "nom": "La Liga", "cat": "FOOT", "div": "SP1", "us": "La_Liga",
+     "equipes": ["Real Madrid", "Barcelona", "Ath Madrid"], "plus_meilleurs": 1},
+    {"id": "soccer_germany_bundesliga", "nom": "Bundesliga", "cat": "FOOT", "div": "D1", "us": "Bundesliga",
+     "equipes": ["Bayern Munich", "Leverkusen", "Dortmund"]},
+    {"id": "soccer_france_ligue_one", "nom": "Ligue 1", "cat": "FOOT", "div": "F1", "us": "Ligue_1",
+     "equipes": ["Paris SG"]},
+    {"id": "soccer_uefa_champs_league", "nom": "Ligue des Champions", "cat": "FOOT", "div": None, "ldc": True},
     {"id": "basketball_nba", "nom": "NBA", "cat": "BASKET", "nba": True},
     {"id": "basketball_euroleague", "nom": "EuroLeague", "cat": "BASKET"},
 ]
+
+# Italie : aucun championnat italien, jamais (verrou, même si quelqu'un l'ajoute à la liste ci-dessus).
+SPORTS_INTERDITS = ("soccer_italy",)
+# Clubs italiens en Ligue des Champions : gardés par défaut (la règle vise le championnat). Mets True pour les retirer.
+EXCLURE_ITALIENS_LDC = (os.environ.get("EXCLURE_ITALIENS_LDC") or "").lower() in ("1", "true", "oui")
+CLUBS_ITALIENS = ["Inter Milan", "Internazionale", "AC Milan", "Milan", "Juventus", "Napoli", "Atalanta",
+                  "Atalanta BC", "AS Roma", "Roma", "Lazio", "Bologna", "Fiorentina", "Como", "Torino"]
 
 # Noms The Odds API / Understat / ESPN -> noms football-data / nba_api.
 # Si le rapport signale "équipe non reconnue", ajoute la correspondance ici.
@@ -105,6 +119,9 @@ ALIASES_RAW = {
     "Stade Rennais": "Rennes", "RC Strasbourg": "Strasbourg", "FC Nantes": "Nantes",
     "Stade Brestois 29": "Brest", "AJ Auxerre": "Auxerre", "Le Havre AC": "Le Havre",
     "Los Angeles Clippers": "LA Clippers",
+    "FC Barcelona": "Barcelona", "Barça": "Barcelona", "Bayern München": "Bayern Munich",
+    "FC Bayern Munich": "Bayern Munich", "FC Bayern München": "Bayern Munich", "Real Madrid CF": "Real Madrid",
+    "Club Atlético de Madrid": "Ath Madrid", "Atletico de Madrid": "Ath Madrid",
 }
 
 
@@ -146,6 +163,9 @@ def match_team(name: str, candidates) -> str | None:
 # SOURCES RÉELLES
 # =============================================================================
 UA = {"User-Agent": "Mozilla/5.0 (compatible; agent-betclic/2.0)"}
+UA_NAV = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/131.0.0.0 Safari/537.36"),
+          "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"}
 
 
 def avec_delai(fn, secondes, *args, relancer=False, **kwargs):
@@ -260,6 +280,12 @@ class SourcesReelles:
 
     # ---- historique foot : football-data.co.uk, 5 saisons ----
     def historique_foot(self, comp, now):
+        memo = self.__dict__.setdefault("_hist", {})
+        if comp["div"] not in memo:
+            memo[comp["div"]] = self._historique_foot(comp, now)
+        return memo[comp["div"]]
+
+    def _historique_foot(self, comp, now):
         y0 = now.year if now.month >= 7 else now.year - 1
         frames = []
         for y in range(y0 - 4, y0 + 1):
@@ -286,32 +312,42 @@ class SourcesReelles:
 
     # ---- historique NBA : nba_api, 3 saisons ----
     def games_nba(self, now):
+        if getattr(self, "_nba", None) is not None:
+            return self._nba
+        g = self._nba_api(now)
+        if g is None:
+            log("   stats.nba.com indisponible : historique NBA récupéré sur ESPN")
+            g = self._nba_espn(now)
+        if g is None:
+            self.echecs.append("Historique NBA (stats.nba.com et ESPN indisponibles) : NBA sur cotes Pinnacle seules")
+        self._nba = g
+        return g
+
+    def _nba_api(self, now):
         try:
             from nba_api.stats.endpoints import leaguegamelog
-        except Exception as e:
-            self.echecs.append(f"nba_api non installé ({e})")
+        except Exception:
             return None
         y0 = now.year if now.month >= 9 else now.year - 1
         frames = []
-        for y in (y0 - 2, y0 - 1, y0):
+        for y in (y0, y0 - 1, y0 - 2):        # saison en cours d'abord : si elle échoue, on passe à ESPN
             saison = f"{y}-{str(y + 1)[2:]}"
             f = CACHE_DIR / f"nba_{saison}.csv"
             if y < y0 and f.exists():           # saisons terminées : cache permanent
                 frames.append(pd.read_csv(f))
                 continue
             try:
-                gl = leaguegamelog.LeagueGameLog(season=saison, season_type_all_star="Regular Season", timeout=40)
+                gl = leaguegamelog.LeagueGameLog(season=saison, season_type_all_star="Regular Season", timeout=25)
                 d = gl.get_data_frames()[0]
                 CACHE_DIR.mkdir(exist_ok=True)
                 d.to_csv(f, index=False)
                 frames.append(d)
             except Exception as e:
-                log(f"nba_api {saison} : {e}")
-                if f.exists():
-                    frames.append(pd.read_csv(f))
+                log(f"   nba_api {saison} : {str(e)[:80]}")
+                if y == y0:
+                    return None
             time.sleep(1.5)
         if not frames:
-            self.echecs.append("Historique NBA (stats.nba.com bloqué ? lance depuis ton PC)")
             return None
         df = pd.concat(frames, ignore_index=True)
         df["dom"] = df["MATCHUP"].astype(str).str.contains("vs.", regex=False)
@@ -320,6 +356,58 @@ class SourcesReelles:
         a = df[~df["dom"]][["GAME_ID", "TEAM_NAME", "PTS"]].rename(columns={"TEAM_NAME": "away", "PTS": "apts"})
         g = h.merge(a, on="GAME_ID")
         g["date"] = pd.to_datetime(g["GAME_DATE"])
+        g["season"] = np.where(g["date"].dt.month >= 9, g["date"].dt.year, g["date"].dt.year - 1)
+        return g[["date", "home", "away", "hpts", "apts", "season"]].sort_values("date").reset_index(drop=True)
+
+    def _nba_espn(self, now):
+        """Résultats NBA jour par jour via le tableau des scores ESPN (saison passée + en cours), avec cache."""
+        CACHE_DIR.mkdir(exist_ok=True)
+        f_res, f_jours = CACHE_DIR / "espn_nba.csv", CACHE_DIR / "espn_nba_jours.txt"
+        res = pd.read_csv(f_res) if f_res.exists() else pd.DataFrame(columns=["jour", "home", "away", "hpts", "apts"])
+        faits = set(f_jours.read_text().split()) if f_jours.exists() else set()
+        hier = now.astimezone(TZ).date() - timedelta(days=1)
+        y0 = now.year if now.month >= 9 else now.year - 1
+        jour, a_faire = datetime(y0 - 1, 10, 15).date(), []
+        while jour <= hier:
+            cle = f"{jour:%Y%m%d}"
+            if jour.month not in (7, 8, 9) and (cle not in faits or (hier - jour).days < 3):
+                a_faire.append(cle)
+            jour += timedelta(days=1)
+        if a_faire:
+            log(f"   ESPN : {len(a_faire)} journée(s) NBA à récupérer (les suivantes seront en cache)")
+        nouveaux, debut, echecs = [], time.time(), 0
+        for cle in a_faire:
+            if time.time() - debut > 420 or echecs > 15:
+                log("   ESPN : arrêt (temps ou erreurs), le reste sera récupéré au prochain lancement")
+                break
+            r = http_get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+                         params={"dates": cle, "limit": 100}, timeout=20, retries=1)
+            if r is None:
+                echecs += 1
+                continue
+            try:
+                for ev in r.json().get("events", []):
+                    if (ev.get("season") or {}).get("type") == 1:               # présaison
+                        continue
+                    if not ((ev.get("status") or {}).get("type") or {}).get("completed"):
+                        continue
+                    eq = {c.get("homeAway"): c for c in ev["competitions"][0]["competitors"]}
+                    nouveaux.append({"jour": cle, "home": eq["home"]["team"]["displayName"],
+                                     "away": eq["away"]["team"]["displayName"],
+                                     "hpts": int(float(eq["home"]["score"])), "apts": int(float(eq["away"]["score"]))})
+                faits.add(cle)
+            except Exception:
+                echecs += 1
+            time.sleep(0.15)
+        if nouveaux:
+            res = pd.concat([res, pd.DataFrame(nouveaux)], ignore_index=True)
+            res = res.drop_duplicates(subset=["jour", "home", "away"], keep="last")
+            res.to_csv(f_res, index=False)
+        f_jours.write_text("\n".join(sorted(faits)))
+        if len(res) < 200:
+            return None
+        g = res.copy()
+        g["date"] = pd.to_datetime(g["jour"].astype(str), format="%Y%m%d")
         g["season"] = np.where(g["date"].dt.month >= 9, g["date"].dt.year, g["date"].dt.year - 1)
         return g[["date", "home", "away", "hpts", "apts", "season"]].sort_values("date").reset_index(drop=True)
 
@@ -349,16 +437,33 @@ class SourcesReelles:
         if not slug:
             return None
         annee = now.year if now.month >= 7 else now.year - 1
-        h = {"X-Requested-With": "XMLHttpRequest", "Referer": f"https://understat.com/league/{slug}/{annee}"}
+        page = f"https://understat.com/league/{slug}/{annee}"
         try:
-            r = requests.get(f"https://understat.com/getLeagueData/{slug}/{annee}", headers={**UA, **h},
-                             cookies={"beget": "begetok"}, timeout=30)
-            r.raise_for_status()
-            df = pd.DataFrame(r.json().get("players", []))
+            with requests.Session() as ses:
+                ses.headers.update(UA_NAV)
+                ses.cookies.set("beget", "begetok")
+                try:                                  # comme un navigateur : la page d'abord, puis les données
+                    ses.get(page, headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}, timeout=30)
+                except requests.RequestException:
+                    pass
+                r = ses.get(f"https://understat.com/getLeagueData/{slug}/{annee}", timeout=30,
+                            headers={"X-Requested-With": "XMLHttpRequest", "Referer": page,
+                                     "Accept": "application/json, text/javascript, */*; q=0.01"})
+            if r.status_code != 200:
+                raise ValueError(f"HTTP {r.status_code}")
+            try:
+                data = r.json()
+            except ValueError:
+                extrait = re.sub(r"\s+", " ", r.text[:80]) or "réponse vide"
+                raise ValueError(f"réponse non JSON : « {extrait} »")
+            df = pd.DataFrame(data.get("players", []))
+            if df.empty:
+                raise ValueError("aucun joueur dans la réponse")
             for c in ("games", "time", "goals", "xG"):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df["team"] = df["team_title"].astype(str).str.split(",").str[-1].str.strip()
             df = df.rename(columns={"player_name": "joueur"})
+            time.sleep(1)
             return df[["joueur", "team", "games", "time", "goals", "xG"]].dropna()
         except Exception as e:
             self.echecs.append(f"Buteurs {comp['nom']} (Understat : {e})")
@@ -440,11 +545,15 @@ class SourcesDemo:
         "SP1": ["Real Madrid", "Barcelona", "Ath Madrid", "Ath Bilbao", "Villarreal", "Betis", "Sociedad",
                 "Girona", "Sevilla", "Valencia", "Celta", "Osasuna", "Getafe", "Mallorca", "Vallecano",
                 "Alaves", "Espanol", "Elche", "Levante", "Oviedo"],
+        "D1": ["Bayern Munich", "Leverkusen", "Dortmund", "RB Leipzig", "Stuttgart", "Ein Frankfurt", "Freiburg",
+               "Wolfsburg", "Hoffenheim", "Werder Bremen", "Mainz", "M'gladbach", "Augsburg", "Union Berlin",
+               "St Pauli", "Heidenheim", "FC Koln", "Hamburg"],
         "F1": ["Paris SG", "Marseille", "Monaco", "Lens", "Lille", "Lyon", "Nice", "Rennes", "Strasbourg",
                "Toulouse", "Brest", "Nantes", "Auxerre", "Angers", "Le Havre", "Lorient", "Metz", "Paris FC"],
     }
     ODDS_NAMES = {"Man City": "Manchester City", "Man United": "Manchester United", "Ath Madrid": "Atlético Madrid",
-                  "Paris SG": "Paris Saint Germain", "Nott'm Forest": "Nottingham Forest", "Lens": "RC Lens"}
+                  "Paris SG": "Paris Saint Germain", "Nott'm Forest": "Nottingham Forest", "Lens": "RC Lens",
+                  "Leverkusen": "Bayer Leverkusen", "Dortmund": "Borussia Dortmund", "Tottenham": "Tottenham Hotspur"}
     NBA = ["Boston Celtics", "Oklahoma City Thunder", "Cleveland Cavaliers", "Denver Nuggets", "New York Knicks",
            "Houston Rockets", "Los Angeles Lakers", "LA Clippers", "Minnesota Timberwolves", "Indiana Pacers",
            "Golden State Warriors", "Memphis Grizzlies", "Detroit Pistons", "Milwaukee Bucks", "Orlando Magic",
@@ -488,9 +597,25 @@ class SourcesDemo:
         p = p / p.sum() * (1 + margin)
         return [round(max(1.01, 1 / x), 2) for x in p]
 
+    def _ev(self, ident, home, away, P, start):
+        mk = markets(P)
+        true3 = [mk["H"], mk["D"], mk["A"]]
+        ev = {"id": ident, "home": self.ODDS_NAMES.get(home, home), "away": self.ODDS_NAMES.get(away, away),
+              "start": start, "betclic": {"h2h": {}, "totals": {}}, "pinnacle": {"h2h": {}, "totals": {}}}
+        ev["betclic"]["h2h"] = dict(zip("HDA", self._odds(true3, 0.065, 0.07)))
+        ev["pinnacle"]["h2h"] = dict(zip("HDA", self._odds(true3, 0.025, 0.03)))
+        m2 = markets(P, 2.5)                    # comme l'API : une seule ligne de buts (2,5) par bookmaker
+        b = self._odds([m2["over"], m2["under"]], 0.06, 0.06)
+        q = self._odds([m2["over"], m2["under"]], 0.025, 0.03)
+        ev["betclic"]["totals"][2.5] = {"Over": b[0], "Under": b[1]}
+        ev["pinnacle"]["totals"][2.5] = {"Over": q[0], "Under": q[1]}
+        return ev
+
     def cotes(self, comp):
         if comp["id"] == "basketball_nba":
             return self._cotes_nba()
+        if comp.get("ldc"):
+            return self._cotes_ldc()
         div = comp.get("div")
         if div not in self.CLUBS:
             return []
@@ -498,28 +623,26 @@ class SourcesDemo:
         clubs = self.CLUBS[div]
         idx = self.rng.permutation(len(clubs))
         evs = []
-        for k in range(0, min(len(idx), 10), 2):
+        for k in range(0, len(idx) - 1, 2):            # une journée complète
             i, j = int(idx[k]), int(idx[k + 1])
-            if comp.get("filtre") and not any(f in clubs[i] + clubs[j] for f in ("Paris SG", "Lens")):
-                continue
             P = score_grid(np.exp(0.22 + att[i] - dfn[j]), np.exp(att[j] - dfn[i]), -0.07)
-            mk = markets(P)
-            true3 = [mk["H"], mk["D"], mk["A"]]
-            ev = {"id": f"{div}-{k}", "home": self.ODDS_NAMES.get(clubs[i], clubs[i]),
-                  "away": self.ODDS_NAMES.get(clubs[j], clubs[j]),
-                  "start": self.now + timedelta(days=1 + k / 4, hours=6),
-                  "betclic": {"h2h": {}, "totals": {}}, "pinnacle": {"h2h": {}, "totals": {}}}
-            bc, pn = self._odds(true3, 0.065, 0.07), self._odds(true3, 0.025, 0.03)
-            ev["betclic"]["h2h"] = dict(zip("HDA", bc))
-            ev["pinnacle"]["h2h"] = dict(zip("HDA", pn))
-            for line in (1.5, 2.5, 3.5):
-                m2 = markets(P, line)
-                b = self._odds([m2["over"], m2["under"]], 0.06, 0.06)
-                q = self._odds([m2["over"], m2["under"]], 0.025, 0.03)
-                ev["betclic"]["totals"][line] = {"Over": b[0], "Under": b[1]}
-                if line == 2.5:
-                    ev["pinnacle"]["totals"][line] = {"Over": q[0], "Under": q[1]}
-            evs.append(ev)
+            evs.append(self._ev(f"{div}-{k}", clubs[i], clubs[j], P,
+                                self.now + timedelta(days=1 + (k % 6) / 3, hours=6)))
+        return evs
+
+    def _cotes_ldc(self):
+        """Une soirée de Ligue des Champions (mardi) : 8 matchs entre clubs des 4 championnats."""
+        pool = []
+        for div in ("E0", "SP1", "D1", "F1"):
+            _, att, dfn = self._league(div)
+            pool += [(self.CLUBS[div][i], att[i] + 0.15, dfn[i] + 0.15) for i in range(6)]
+        idx = self.rng.permutation(len(pool))[:16]
+        mardi = (self.now + timedelta(days=(1 - self.now.weekday()) % 7)).replace(hour=17, minute=45)
+        evs = []
+        for k in range(0, 16, 2):
+            (h, ah, dh), (a, aa, da) = pool[int(idx[k])], pool[int(idx[k + 1])]
+            P = score_grid(np.exp(0.18 + ah - da), np.exp(aa - dh), -0.07)
+            evs.append(self._ev(f"ldc-{k}", h, a, P, mardi + timedelta(hours=0 if k < 4 else 2, minutes=15 if k >= 4 else 0)))
         return evs
 
     def historique_foot(self, comp, now):
@@ -694,6 +817,60 @@ def option(match, marche, libelle, cote, p_mod, p_mkt, cat, groupe):
 
 
 # =============================================================================
+# PÉRIMÈTRE : quels matchs analyser
+# =============================================================================
+def classement_actuel(hist, now) -> list[str]:
+    """Classement de la saison en cours (points, puis différence de buts, puis buts marqués)."""
+    s = hist[hist["date"] >= season_start_foot(now)]
+    if s.empty:
+        return []
+    pts, diff, bm = {}, {}, {}
+    for r in s.itertuples():
+        for eq, gf, ga in ((r.home, r.hg, r.ag), (r.away, r.ag, r.hg)):
+            pts[eq] = pts.get(eq, 0) + (3 if gf > ga else 1 if gf == ga else 0)
+            diff[eq] = diff.get(eq, 0) + gf - ga
+            bm[eq] = bm.get(eq, 0) + gf
+    return sorted(pts, key=lambda t: (-pts[t], -diff[t], -bm[t]))
+
+
+def perimetre(comp, src, now):
+    """Renvoie (clubs retenus en noms normalisés, texte lisible) ; None = tous les matchs."""
+    if comp.get("ldc"):
+        txt = "tous les matchs" + (" (sans les clubs italiens)" if EXCLURE_ITALIENS_LDC else "")
+        return None, txt
+    if not comp.get("equipes"):
+        return None, "tous les matchs"
+    retenus = list(comp["equipes"])
+    ajouts = []
+    if comp.get("top_n") or comp.get("plus_meilleurs"):
+        hist = src.historique_foot(comp, now) if comp.get("div") else None
+        ordre = classement_actuel(hist, now) if hist is not None else []
+        connus = {canon(t) for t in retenus}
+        if comp.get("top_n"):
+            ajouts += [t for t in ordre[:comp["top_n"]] if canon(t) not in connus]
+        if comp.get("plus_meilleurs"):
+            ajouts += [t for t in ordre if canon(t) not in connus and t not in ajouts][:comp["plus_meilleurs"]]
+        if not ordre:
+            src.echecs.append(f"Classement {comp['nom']} indisponible : seuls les clubs fixes sont retenus")
+    retenus += ajouts
+    txt = ", ".join(retenus[:len(comp["equipes"])])
+    if ajouts:
+        txt += " + " + ", ".join(ajouts) + (" (4e actuel)" if comp.get("plus_meilleurs") and not comp.get("top_n")
+                                             else " (top actuel)")
+    return {canon(t) for t in retenus}, txt
+
+
+def garder_match(ev, clubs) -> bool:
+    if clubs is None:
+        return True
+    return canon(ev["home"]) in clubs or canon(ev["away"]) in clubs
+
+
+def est_italien(nom) -> bool:
+    return canon(nom) in {canon(c) for c in CLUBS_ITALIENS}
+
+
+# =============================================================================
 # ANALYSE FOOT
 # =============================================================================
 def analyser_foot(comp, events, src, now):
@@ -734,6 +911,8 @@ def analyser_foot(comp, events, src, now):
 
         bc, pn = ev["betclic"], ev["pinnacle"]
         mk = markets(P) if P is not None else None
+        if P is not None:                     # probabilités du modèle sur plusieurs lignes de buts
+            m["buts_mod"] = {l: (markets(P, l)["over"], markets(P, l)["under"]) for l in LIGNES_BUTS}
         fair = devig_dict(pn["h2h"], "HDA")
         noms = {"H": f"Victoire {ev['home']}", "D": "Match nul", "A": f"Victoire {ev['away']}"}
         for k in "HDA":
@@ -860,6 +1039,41 @@ def analyser_nba(comp, events, src, now, blessures):
 
 
 # =============================================================================
+# NOMBRE DE BUTS : conseil pour chaque match de foot
+# =============================================================================
+def conseils_buts(matchs_f):
+    """Pour chaque match : les lignes +1,5 / +2,5 / +3,5 (chance, cote Betclic si proposée) et un conseil."""
+    out = []
+    for m in sorted(matchs_f, key=lambda x: x["start"]):
+        opts = {o["libelle"]: o for o in m["options"] if o["marche"] == "Buts"}
+        lignes = []
+        for l in sorted(set(LIGNES_BUTS) | {float(re.sub(r"[^0-9,]", "", o["libelle"]).replace(",", "."))
+                                           for o in opts.values()}):
+            for sens, i in (("Plus", 0), ("Moins", 1)):
+                lib = f"{sens} de {l:g} buts".replace(".", ",")
+                o = opts.get(lib)
+                p = o["p"] if o else (m.get("buts_mod", {}).get(l, (None, None))[i])
+                if p is None:
+                    continue
+                lignes.append({"ligne": l, "sens": sens, "libelle": lib, "p": p, "opt": o,
+                               "cote": o["cote"] if o else None, "cote_min": 1 / p})
+        if not lignes:
+            continue
+        jouables = [x for x in lignes if x["opt"] and x["opt"]["cote"] >= COTE_MIN and not x["opt"]["alerte"]
+                    and x["opt"]["statut"] != "SUSPECT"]
+        value = [x for x in jouables if x["opt"]["statut"] == "VALUE"]
+        if value:
+            choix, raison = max(value, key=lambda x: x["opt"]["edge"]), "bonne cote"
+        elif jouables:
+            choix, raison = max(jouables, key=lambda x: x["p"]), "le plus probable (cote un peu basse)"
+        else:                                  # aucune cote Betclic : la ligne la plus probable au-dessus de 1,5 buts
+            sans = [x for x in lignes if x["p"] <= 0.85] or lignes
+            choix, raison = max(sans, key=lambda x: x["p"]), "à vérifier sur Betclic"
+        out.append({"match": m, "lignes": lignes, "choix": choix, "raison": raison})
+    return out
+
+
+# =============================================================================
 # SÉLECTION : value bets, plus probables, combinés, outsiders
 # =============================================================================
 def selectionner(matchs):
@@ -876,47 +1090,111 @@ def selectionner(matchs):
     return value, probables, suspects
 
 
-def construire_combines(matchs):
-    """Combinés de 2 à 4 sélections, une seule par match (événements indépendants : on peut multiplier)."""
-    opts = [o for m in matchs for o in m["options"]
-            if o["cote"] >= COTE_MIN and o["statut"] != "SUSPECT" and not o["alerte"]]
+COMBI_EDGE_MIN = -0.06      # une sélection de combiné peut être un peu sous le juste prix (marge Betclic), pas plus
 
-    def meilleurs(cands, taille_max, cote_min, cote_max, critere):
-        cands = sorted(cands, key=lambda o: -o["p"])[:14]
-        best = []
-        for k in range(2, taille_max + 1):
-            for combo in itertools.combinations(cands, k):
-                if len({o["match_id"] for o in combo}) < k:
-                    continue
-                cote = math.prod(o["cote"] for o in combo)
-                if not (cote_min <= cote <= cote_max):
-                    continue
-                p = math.prod(o["p"] for o in combo)
-                best.append({"legs": combo, "cote": cote, "p": p, "ev": p * cote - 1})
-        best.sort(key=critere)
-        retenus, deja = [], set()
-        for c in best:                       # 2 combinés sans sélection en commun
-            ids = {(o["match_id"], o["libelle"]) for o in c["legs"]}
-            if ids & deja:
+
+def _combo(legs, nom=""):
+    legs = tuple(legs)
+    cote = math.prod(o["cote"] for o in legs)
+    p = math.prod(o["p"] for o in legs)
+    return {"nom": nom, "legs": legs, "cote": cote, "p": p, "ev": p * cote - 1}
+
+
+def _chercher(cands, kmin, kmax, cmin, cmax, n=2, critere=lambda c: -c["p"]):
+    """Les n meilleurs combinés (une sélection par match), sans sélection en commun entre eux."""
+    cands = sorted(cands, key=lambda o: -o["p"])[:14]
+    trouves = []
+    for k in range(kmin, kmax + 1):
+        for legs in itertools.combinations(cands, k):
+            if len({o["match_id"] for o in legs}) < k:
                 continue
-            retenus.append(c)
-            deja |= ids
-            if len(retenus) == 2:
-                break
-        return retenus
+            cote = math.prod(o["cote"] for o in legs)
+            if cmin <= cote <= cmax:
+                trouves.append(_combo(legs))
+    trouves.sort(key=critere)
+    retenus, deja = [], set()
+    for c in trouves:
+        ids = {(o["match_id"], o["libelle"]) for o in c["legs"]}
+        if ids & deja:
+            continue
+        retenus.append(c)
+        deja |= ids
+        if len(retenus) == n:
+            break
+    return retenus
 
-    value = [o for o in opts if o["statut"] == "VALUE"]
-    proches = [o for o in opts if o["edge"] >= -0.025]
-    res = {}
-    for nom, (tmax, cmin, cmax, crit) in {
-        "prudent": (3, 1.8, 3.2, lambda c: -c["p"]),       # le plus probable dans la fourchette de cote
-        "fun": (4, 4.0, 10.0, lambda c: -c["ev"]),         # la meilleure espérance
-    }.items():
-        combos = meilleurs(value, tmax, cmin, cmax, crit)
-        res[nom] = {"combos": combos, "value": True}
-        if not combos:
-            res[nom] = {"combos": meilleurs(proches, tmax, cmin, cmax, crit), "value": False}
+
+def _plus_probable(m, filtre=lambda o: True):
+    ok = [o for o in m["options"] if o["cote"] >= COTE_MIN and o["statut"] != "SUSPECT" and not o["alerte"]
+          and filtre(o)]
+    return max(ok, key=lambda o: o["p"]) if ok else None
+
+
+def construire_combines(matchs):
+    """Paris Safe (2,00-2,50), Paris plus difficiles (~4,00), Combiné global, Spécial Ligue des Champions."""
+    matchs = [m for m in matchs if m["cat"] == "FOOT"]          # combinés : foot uniquement
+    pool = [o for m in matchs for o in m["options"]
+            if o["cote"] >= COTE_MIN and o["statut"] != "SUSPECT" and not o["alerte"] and o["edge"] >= COMBI_EDGE_MIN]
+    res = {
+        "safe": _chercher([o for o in pool if o["p"] >= 0.60], 2, 4, 2.00, 2.50),
+        "difficile": _chercher([o for o in pool if o["p"] >= 0.50], 3, 5, 3.60, 4.50,
+                               critere=lambda c: (-c["p"], abs(c["cote"] - 4))),
+        "global": None, "ldc": [],
+    }
+    foot = sorted([m for m in matchs if m["cat"] == "FOOT"], key=lambda m: m["start"])
+    legs = [l for l in (_plus_probable(m) for m in foot) if l]
+    if len(legs) >= 2:
+        res["global"] = _combo(legs, f"Tous les matchs de la sélection ({len(legs)})")
+
+    soirees = {}
+    for m in foot:
+        if m["comp"] == "Ligue des Champions":
+            soirees.setdefault(m["start"].astimezone(TZ).date(), []).append(m)
+    for jour, ms in sorted(soirees.items()):
+        if len(ms) < 2:
+            continue
+        props = []
+        nuit = [o for m in ms for o in m["options"] if o in pool]
+        sur = _chercher([o for o in nuit if o["p"] >= 0.55], 2, 3, 1.80, 2.60, n=1)
+        if sur:
+            props.append({**sur[0], "nom": "Le plus sûr de la soirée"})
+        fav = [l for l in (_plus_probable(m, lambda o: o["marche"] == "1N2" and o["libelle"].startswith("Victoire")
+                                          and o["p"] >= 0.55) for m in ms) if l]
+        if len(fav) >= 2:
+            props.append(_combo(fav, "Les favoris de la soirée"))
+        buts = [l for l in (_plus_probable(m, lambda o: o["marche"] == "Buts") for m in ms) if l]
+        if len(buts) >= 2:
+            props.append(_combo(buts, "Les buts de la soirée"))
+        obj4 = _chercher(nuit, 2, 4, 3.50, 4.60, n=1, critere=lambda c: (-c["p"], abs(c["cote"] - 4)))
+        if obj4:
+            props.append({**obj4[0], "nom": "Objectif cote 4"})
+        tous = [l for l in (_plus_probable(m) for m in ms) if l]
+        if len(tous) >= 2:
+            props.append(_combo(tous, f"Tous les matchs de la soirée ({len(tous)})"))
+        vus, uniques = set(), []
+        for c in props:                         # pas deux fois le même ticket
+            cle = frozenset((o["match_id"], o["libelle"]) for o in c["legs"])
+            if cle not in vus:
+                vus.add(cle)
+                uniques.append(c)
+        res["ldc"].append({"jour": jour, "n": len(ms), "combos": uniques})
     return res
+
+
+JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+def groupes_combines(comb):
+    """Liste (titre, explication, combinés) commune à l'e-mail, au PDF et à la page."""
+    g = [("Paris Safe", "Cote totale entre 2,00 et 2,50 : les sélections les plus probables.", comb["safe"]),
+         ("Paris plus difficiles", "Davantage de sélections pour une cote totale autour de 4,00.", comb["difficile"])]
+    if comb["global"]:
+        g.append(("Combiné global", "Une sélection par match (la plus probable) sur tous les matchs retenus. "
+                  "Très peu de chances de passer : pour le plaisir.", [comb["global"]]))
+    for s in comb["ldc"]:
+        g.append((f"Spécial Ligue des Champions : {JOURS_FR[s['jour'].weekday()]} {s['jour']:%d/%m}",
+                  f"{s['n']} matchs ce soir-là : plusieurs combinés possibles.", s["combos"]))
+    return g
 
 
 def outsiders(matchs):
@@ -1078,32 +1356,43 @@ def section_probables(probables):
 
 def section_combines(comb):
     blocs = []
-    for nom, label, fourchette in (("prudent", "Combinés prudents", "cote 1,80 – 3,20 · 2 à 3 sélections"),
-                                    ("fun", "Combinés fun", "cote 4 – 10 · 2 à 4 sélections")):
-        info = comb[nom]
-        avert = "" if info["value"] else (
-            f'<div style="background:{C["ambre_f"]};color:{C["ambre"]};padding:8px 12px;border-radius:6px;'
-            f'font-size:12px;margin:6px 0">Pas assez de sélections avec value : combinés <b>indicatifs</b>, '
-            f"construits avec des cotes proches du juste prix. Leur espérance est négative.</div>")
+    for titre_g, expl, combos in groupes_combines(comb):
         cartes = []
-        for c in info["combos"]:
+        for c in combos:
             legs = "".join(f'<tr><td style="padding:4px 0;font-size:13px">{e(o["libelle"])}'
                            f'<span style="color:{C["mut"]};font-size:11px"> · {e(o["match"])} · {heure(o["start"])}</span></td>'
                            f'<td style="padding:4px 0;font-size:13px;text-align:right;white-space:nowrap">'
                            f'{o["cote"]:.2f} <span style="color:{C["mut"]}">({pct(o["p"])})</span></td></tr>'
                            for o in c["legs"])
             ev_col = C["vert"] if c["ev"] > 0 else C["rouge"]
+            nom = f'<div style="font-weight:700;font-size:13px;margin-bottom:4px">{e(c["nom"])}</div>' if c.get("nom") else ""
             cartes.append(
                 f'<div style="border:1px solid {C["bord"]};border-radius:8px;padding:12px 14px;margin:8px 0;background:{C["carte"]}">'
-                f'<table role="presentation" style="width:100%;border-collapse:collapse">{legs}</table>'
+                f'{nom}<table role="presentation" style="width:100%;border-collapse:collapse">{legs}</table>'
                 f'<div style="border-top:1px solid {C["bord"]};margin-top:6px;padding-top:8px;font-size:13px">'
                 f'Cote totale <b style="font-size:16px">{c["cote"]:.2f}</b> &nbsp;·&nbsp; '
                 f'chance de passer <b>{pct(c["p"])}</b> &nbsp;·&nbsp; '
-                f'espérance <b style="color:{ev_col}">{100 * c["ev"]:+.1f} %</b></div></div>')
-        corps = "".join(cartes) or f'<p style="color:{C["mut"]};font-size:13px">Aucune combinaison dans la fourchette.</p>'
-        blocs.append(f'<h3 style="font-size:14px;margin:16px 0 0">{label} '
-                     f'<span style="font-weight:400;color:{C["mut"]};font-size:12px">({fourchette})</span></h3>{avert}{corps}')
+                f'rentabilité <b style="color:{ev_col}">{100 * c["ev"]:+.1f} %</b></div></div>')
+        corps = "".join(cartes) or f'<p style="color:{C["mut"]};font-size:13px">Aucune combinaison possible cette semaine.</p>'
+        blocs.append(f'<h3 style="font-size:14px;margin:16px 0 0">{e(titre_g)}</h3>'
+                     f'<div style="color:{C["mut"]};font-size:12px">{e(expl)}</div>{corps}')
     return "".join(blocs)
+
+
+def section_buts_html(conseils):
+    lignes = []
+    for x in conseils:
+        m, ch = x["match"], x["choix"]
+        cases = " · ".join(f'{l["libelle"].replace(" buts", "").replace("Plus de ", "+").replace("Moins de ", "−")} : '
+                           f'<b>{pct(l["p"])}</b>' + (f' ({l["cote"]:.2f})' if l["cote"] else "")
+                           for l in x["lignes"] if l["sens"] == "Plus" or l["ligne"] == 3.5)
+        cote = f'{ch["cote"]:.2f}' if ch["cote"] else f'cote mini {ch["cote_min"]:.2f}'
+        lignes.append([f'<b>{e(m["home"])} – {e(m["away"])}</b><div style="color:{C["mut"]};font-size:12px">'
+                       f'{e(m["comp"])} · {heure(m["start"])}</div>',
+                       f'<b>{e(ch["libelle"])}</b> · {cote} · {pct(ch["p"])}'
+                       f'<div style="color:{C["mut"]};font-size:11px">{e(x["raison"])}</div>',
+                       f'<span style="font-size:12px">{cases}</span>'])
+    return table(["Match", "Conseil buts", "Chance par ligne (cote Betclic)"], lignes, "Aucun match de foot retenu.")
 
 
 def ligne_equipe_foot(st):
@@ -1234,6 +1523,8 @@ def generer_html(matchs_f, matchs_b, src, now, fin):
         + lecture_html()
         + titre("① Sélections avec value", "La cote Betclic est au-dessus de la probabilité estimée. C'est la seule liste à jouer en simple.")
         + section_value(value)
+        + titre("Nombre de buts : match par match", "Chance de chaque ligne d'après le modèle et le marché ; cote Betclic quand elle est proposée.")
+        + section_buts_html(conseils_buts(matchs_f))
         + titre("② Combinés", "Une sélection maximum par match. La chance de passer = produit des probabilités.")
         + section_combines(comb)
         + titre("③ Les plus probables", "Pour réduire le risque. Edge négatif = la cote est trop basse pour être rentable à long terme.")
@@ -1275,6 +1566,8 @@ def pc(x) -> str:
     """Pourcentage arrondi : 51 %."""
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "–"
+    if 0 < x < 0.01:
+        return "moins de 1 %"
     return f"{round(100 * x)} %"
 
 
@@ -1311,7 +1604,7 @@ def synthese(matchs_f, matchs_b):
     a_jouer = sorted([o for o in value if not o["alerte"]], key=lambda o: -o["p"])
     buteurs = sorted([b for m in matchs_f for b in m["buteurs"]], key=lambda b: -b["p"])
     return {"value": value, "a_jouer": a_jouer, "probables": probables, "suspects": suspects,
-            "comb": construire_combines(tous), "buteurs": buteurs,
+            "comb": construire_combines(tous), "buteurs": buteurs, "buts": conseils_buts(matchs_f),
             "out_f": outsiders(matchs_f), "out_b": outsiders(matchs_b)}
 
 
@@ -1351,23 +1644,43 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
                 + (f'<div style="font-size:15px;font-weight:700;margin-top:8px">{e(mise)}</div>' if mise else "")
                 + al + "</div>")
 
-    def carte_combine(c, titre_c, value_ok):
-        legs = "".join(
-            f'<tr><td style="padding:6px 0;font-size:15px;border-bottom:1px solid {bord}">'
-            f'<b>{e(o["libelle"])}</b><br><span style="color:{gris};font-size:13px">{e(o["match"])} · {heure(o["start"])}</span></td>'
-            f'<td style="padding:6px 0;font-size:16px;text-align:right;font-weight:700;border-bottom:1px solid {bord}">{fr(o["cote"])}</td></tr>'
-            for o in c["legs"])
-        avert = ("" if value_ok else
-                 f'<div style="font-size:14px;color:#9a5b00;margin-top:8px">À titre indicatif : pas assez de bons paris '
-                 f'cette semaine, ce combiné n\'est pas rentable sur le long terme.</div>')
+    def carte_combine(c, titre_c):
+        if len(c["legs"]) > 6:              # long combiné : une ligne par sélection
+            legs = "".join(
+                f'<tr><td style="padding:3px 0;font-size:13px;border-bottom:1px solid {bord}">'
+                f'<b>{e(o["libelle"])}</b> <span style="color:{gris}">· {e(o["match"])}</span></td>'
+                f'<td style="padding:3px 0;font-size:13px;text-align:right;font-weight:700;border-bottom:1px solid {bord}">'
+                f'{fr(o["cote"])}</td></tr>' for o in c["legs"])
+        else:
+            legs = "".join(
+                f'<tr><td style="padding:6px 0;font-size:15px;border-bottom:1px solid {bord}">'
+                f'<b>{e(o["libelle"])}</b><br><span style="color:{gris};font-size:13px">{e(o["match"])} · {heure(o["start"])}</span></td>'
+                f'<td style="padding:6px 0;font-size:16px;text-align:right;font-weight:700;border-bottom:1px solid {bord}">{fr(o["cote"])}</td></tr>'
+                for o in c["legs"])
+        avert = ("" if c["ev"] > 0 else
+                 f'<div style="font-size:13px;color:#9a5b00;margin-top:8px">Rentabilité négative : la marge de Betclic '
+                 f'pèse plus que l\'avantage des sélections. Pari plaisir, pas un placement.</div>')
         return (f'<div style="border:1px solid {bord};border-radius:12px;padding:16px;margin:12px 0;background:#fff">'
-                f'<div style="font-size:18px;font-weight:800;margin-bottom:6px">{titre_c}</div>'
+                f'<div style="font-size:18px;font-weight:800;margin-bottom:6px">{e(titre_c)}</div>'
                 f'<table role="presentation" style="width:100%;border-collapse:collapse">{legs}</table>'
                 f'<table role="presentation" style="width:100%;border-collapse:collapse;margin-top:8px"><tr>'
                 + chiffre(fr(c["cote"]), "cote totale")
                 + chiffre(pc(c["p"]), "chance de passer")
                 + chiffre(f"{round(100 * c['ev']):+d} %", "rentabilité", vert if c["ev"] > 0 else "#b42318")
                 + f"</tr></table>{avert}</div>")
+
+    def ligne_buts(x, derniere):
+        m, ch = x["match"], x["choix"]
+        autres = " · ".join(f'{l["libelle"].replace(" buts", "").replace("Plus de ", "+").replace("Moins de ", "−")} '
+                            f'{pc(l["p"])}' for l in x["lignes"] if l["sens"] == "Plus" or l["ligne"] == 3.5)
+        cote = fr(ch["cote"]) if ch["cote"] else f'mini {fr(ch["cote_min"] * 1.05)}'
+        couleur = vert if x["raison"] == "bonne cote" else txt
+        sep = "" if derniere else f"border-bottom:1px solid {bord};"
+        return (f'<div style="padding:10px 0;{sep}">'
+                f'<div style="font-size:13px;color:{gris}">{e(m["home"])} – {e(m["away"])} · {heure(m["start"])}</div>'
+                f'<div style="font-size:16px;margin-top:2px"><b style="color:{couleur}">{e(ch["libelle"])}</b> · '
+                f'<b>{cote}</b> · {pc(ch["p"])}</div>'
+                f'<div style="font-size:12px;color:{gris};margin-top:2px">{autres}</div></div>')
 
     def titre_sec(t, sous=""):
         s = f'<div style="font-size:15px;color:{gris};margin-top:2px">{sous}</div>' if sous else ""
@@ -1384,11 +1697,20 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
                  f"rentable cette semaine. C'est normal certaines semaines : le mieux est de ne rien jouer.")
         bloc_paris = ""
 
-    comb = syn["comb"]
     blocs_comb = ""
-    for cle, nom in (("prudent", "Combiné prudent"), ("fun", "Combiné plaisir")):
-        if comb[cle]["combos"]:
-            blocs_comb += carte_combine(comb[cle]["combos"][0], nom, comb[cle]["value"])
+    for titre_g, expl, combos in groupes_combines(syn["comb"]):
+        if not combos:
+            continue
+        blocs_comb += (f'<div style="font-size:18px;font-weight:800;margin:22px 0 0">{e(titre_g)}</div>'
+                       f'<div style="font-size:14px;color:{gris}">{e(expl)}</div>')
+        for c in combos[:2] if not titre_g.startswith("Spécial") else combos:
+            blocs_comb += carte_combine(c, c.get("nom") or titre_g)
+    bloc_buts_mail = ""
+    if syn["buts"]:
+        bloc_buts_mail = (f'<div style="border:1px solid {bord};border-radius:12px;padding:4px 16px;margin:12px 0;background:#fff">'
+                          + "".join(ligne_buts(x, i == len(syn["buts"]) - 1) for i, x in enumerate(syn["buts"]))
+                          + f'</div><div style="font-size:13px;color:{gris}">En vert : la cote Betclic est meilleure que '
+                            f'la vraie chance. « mini » = pas de cote Betclic reçue, joue seulement au-dessus.</div>')
 
     buteurs = syn["buteurs"][:3]
     bloc_but = "".join(
@@ -1414,7 +1736,8 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
         f'<div style="font-size:15px;color:{gris};margin-top:4px">Matchs du {now.astimezone(TZ):%d/%m} au {fin.astimezone(TZ):%d/%m}</div>'
         f'<div style="font-size:17px;line-height:1.5;margin-top:16px">{intro}</div>'
         + (titre_sec("Les paris à jouer", "Un pari = une mise séparée.") + bloc_paris if bloc_paris else "")
-        + (titre_sec("Les combinés", "Plusieurs paris sur le même ticket : tous doivent passer.") + blocs_comb if blocs_comb else "")
+        + (titre_sec("Nombre de buts : match par match", "Notre conseil pour chaque match, et la chance de chaque ligne (+1,5, +2,5, +3,5).") + bloc_buts_mail if bloc_buts_mail else "")
+        + (titre_sec("Les combinés", "Plusieurs paris sur le même ticket : tous doivent passer. Une sélection par match.") + blocs_comb if blocs_comb else "")
         + (titre_sec("Buteurs à surveiller", "La cote buteur n'est pas connue à l'avance : vérifie-la sur Betclic et la compo.") + bloc_but if bloc_but else "")
         + (f'<div style="font-size:16px;background:#e8f0fe;border-radius:12px;padding:14px 16px;margin-top:28px;line-height:1.5">{pdf_txt}</div>' if pdf_txt else "")
         + f'<div style="font-size:13px;color:{gris};margin-top:24px;line-height:1.6">'
@@ -1466,8 +1789,10 @@ def generer_pdf(chemin, matchs_f, matchs_b, syn, src, now, fin) -> bool:
     st = {
         "h1": ParagraphStyle("h1", fontName="Helvetica-Bold", fontSize=22, leading=27, spaceAfter=2),
         "sous": ParagraphStyle("sous", fontName="Helvetica", fontSize=10.5, leading=14, textColor=GRIS),
-        "h2": ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=15, leading=19, spaceBefore=14, spaceAfter=3),
-        "intro": ParagraphStyle("intro", fontName="Helvetica", fontSize=10, leading=13.5, textColor=GRIS, spaceAfter=6),
+        "h2": ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=15, leading=19, spaceBefore=14, spaceAfter=3,
+                             keepWithNext=1),
+        "intro": ParagraphStyle("intro", fontName="Helvetica", fontSize=10, leading=13.5, textColor=GRIS, spaceAfter=6,
+                                keepWithNext=1),
         "p": ParagraphStyle("p", fontName="Helvetica", fontSize=10.5, leading=14.5),
         "cell": ParagraphStyle("cell", fontName="Helvetica", fontSize=9.5, leading=12.5),
         "cellb": ParagraphStyle("cellb", fontName="Helvetica-Bold", fontSize=10, leading=13),
@@ -1539,6 +1864,13 @@ def generer_pdf(chemin, matchs_f, matchs_b, syn, src, now, fin) -> bool:
     t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#eef3fd")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
                            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
     el += [P("Comment lire ce rapport", "h2"), t]
+    if getattr(src, "perimetre", None):
+        t = Table([[P(f"<b>{pdf_txt(n)}</b>"), P(pdf_txt(txt))] for n, txt in src.perimetre],
+                  colWidths=[0.24 * LARG, 0.76 * LARG])
+        t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.3, BORD), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        el += [P("Matchs analysés cette semaine", "h2"),
+               P("Seuls les matchs impliquant ces clubs sont retenus. Aucun championnat italien.", "intro"), t]
 
     # ---------------- 1. paris à jouer ----------------
     el += [P("1. Les paris à jouer", "h2"),
@@ -1556,30 +1888,54 @@ def generer_pdf(chemin, matchs_f, matchs_b, syn, src, now, fin) -> bool:
         el += [Spacer(1, 4), P(pdf_txt("Écartés malgré une bonne cote (blessure signalée ou écart trop grand pour être fiable) : "
                          + " ; ".join(f'{o["libelle"]} ({o["match"]})' for o in douteux[:6])), "petit")]
 
+    # ---------------- 1 bis. nombre de buts ----------------
+    el += [P("Nombre de buts : match par match", "h2"),
+           P("Chance de chaque ligne d'après le modèle et le marché. Entre parenthèses : la cote Betclic quand elle est "
+             "proposée ; sinon, joue seulement si la cote affichée sur Betclic dépasse la cote mini.", "intro")]
+    lignes = []
+    for x in syn["buts"]:
+        m, ch = x["match"], x["choix"]
+        def case(l, sens):
+            l2 = next((y for y in x["lignes"] if y["ligne"] == l and y["sens"] == sens), None)
+            if not l2:
+                return P("–")
+            c = f'{fr(l2["cote"])}' if l2["cote"] else f'mini {fr(l2["cote_min"])}'
+            gras = l2 is ch
+            return P((f'<font color="{coul(VERT)}"><b>' if gras else "") + f'{pc(l2["p"])}<br/>'
+                     f'<font size="8">{c}</font>' + ("</b></font>" if gras else ""))
+        cote_ch = fr(ch["cote"]) if ch["cote"] else f'mini {fr(ch["cote_min"])}'
+        lignes.append([P(f'<b>{pdf_txt(m["home"])} - {pdf_txt(m["away"])}</b><br/><font size="8.5" color="{coul(GRIS)}">'
+                         f'{pdf_txt(m["comp"])} · {pdf_txt(heure(m["start"]))}</font>'),
+                       case(1.5, "Plus"), case(2.5, "Plus"), case(3.5, "Plus"), case(3.5, "Moins"),
+                       P(f'<b>{pdf_txt(ch["libelle"])}</b><br/>{cote_ch} · {pc(ch["p"])}<br/>'
+                         f'<font size="8" color="{coul(GRIS)}">{pdf_txt(x["raison"])}</font>')])
+    el += tableau(["Match", "+1,5 buts", "+2,5 buts", "+3,5 buts", "-3,5 buts", "Conseil"], lignes,
+                  [0.30, 0.11, 0.11, 0.11, 0.11, 0.26], "Aucun match de foot retenu cette semaine.")
+
     # ---------------- 2. combinés ----------------
     el += [P("2. Les combinés", "h2"),
-           P("Plusieurs paris sur le même ticket : tous doivent passer. Une seule sélection par match.", "intro")]
-    for cle, nom in (("prudent", "Combinés prudents (cote totale entre 1,80 et 3,20)"),
-                     ("fun", "Combinés plaisir (cote totale entre 4 et 10)")):
-        info = syn["comb"][cle]
-        el.append(P(f"<b>{pdf_txt(nom)}</b>", "p"))
-        if not info["value"] and info["combos"]:
-            el.append(P(pdf_txt("À titre indicatif : pas assez de bons paris, ces combinés ne sont pas rentables "
-                                "sur le long terme."), "petit"))
-        if not info["combos"]:
-            el.append(P("Aucune combinaison possible dans cette fourchette.", "intro"))
-        for c in info["combos"]:
+           P("Plusieurs paris sur le même ticket : tous doivent passer. Une seule sélection par match. "
+             "Rentabilité négative = la marge de Betclic pèse plus que l'avantage : pari plaisir.", "intro")]
+    for titre_g, expl, combos in groupes_combines(syn["comb"]):
+        tete = [Spacer(1, 4), P(f"<b>{pdf_txt(titre_g)}</b>", "p"), P(pdf_txt(expl), "petit")]
+        if not combos:
+            el += tete + [P("Aucune combinaison possible cette semaine.", "intro")]
+        for i_c, c in enumerate(combos):
             rows = [[P(f'<b>{pdf_txt(o["libelle"])}</b> <font size="8.5" color="{coul(GRIS)}">· {pdf_txt(o["match"])} · '
                        f'{pdf_txt(heure(o["start"]))}</font>'), P(f'<b>{fr(o["cote"])}</b>'), P(pc(o["p"]))]
                     for o in c["legs"]]
             ev_c = coul(VERT) if c["ev"] > 0 else coul(ROUGE)
-            rows.append([P(f'<b>Cote totale {fr(c["cote"])}</b> · chance de passer <b>{pc(c["p"])}</b> · '
-                           f'rentabilité <font color="{ev_c}"><b>{round(100 * c["ev"]):+d} %</b></font>'), "", ""])
+            entete = [[P(f'<b>{pdf_txt(c["nom"])}</b>'), "", ""]] if c.get("nom") and c["nom"] != titre_g else []
+            rows = entete + rows + [[P(f'<b>Cote totale {fr(c["cote"])}</b> · chance de passer <b>{pc(c["p"])}</b> · '
+                                       f'rentabilité <font color="{ev_c}"><b>{round(100 * c["ev"]):+d} %</b></font>'), "", ""]]
             t = Table(rows, colWidths=[0.72 * LARG, 0.13 * LARG, 0.15 * LARG])
-            t.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, BORD), ("LINEBELOW", (0, 0), (-1, -2), 0.3, BORD),
-                                   ("SPAN", (0, -1), (-1, -1)), ("BACKGROUND", (0, -1), (-1, -1), FOND),
-                                   ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
-            el += [Spacer(1, 4), KeepTogether([t]), Spacer(1, 4)]
+            stl = [("BOX", (0, 0), (-1, -1), 0.5, BORD), ("LINEBELOW", (0, 0), (-1, -2), 0.3, BORD),
+                   ("SPAN", (0, -1), (-1, -1)), ("BACKGROUND", (0, -1), (-1, -1), FOND),
+                   ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]
+            if entete:
+                stl += [("SPAN", (0, 0), (-1, 0)), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef3fd"))]
+            t.setStyle(TableStyle(stl))
+            el += [KeepTogether((tete if i_c == 0 else []) + [Spacer(1, 4), t]), Spacer(1, 4)]
 
     # ---------------- 3. les plus sûrs ----------------
     el += [P("3. Les plus sûrs (même sans avantage)", "h2"),
@@ -1772,13 +2128,19 @@ def main():
     now = src.now if args.demo else datetime.now(timezone.utc)
     fin = now + timedelta(days=args.jours)
 
-    log("1/4 Cotes Betclic + Pinnacle")
-    evenements = {}
+    log("1/4 Cotes Betclic + Pinnacle (marchés vainqueur et nombre de buts)")
+    evenements, src.perimetre = {}, []
     for comp in COMPETITIONS:
-        evs = [ev for ev in src.cotes(comp)
-               if now <= ev["start"] <= fin and ev["betclic"]["h2h"]
-               and (not comp.get("filtre") or any(f in ev["home"] + " " + ev["away"] for f in comp["filtre"]))]
-        log(f"   {comp['nom']} : {len(evs)} match(s)")
+        if comp["id"].startswith(SPORTS_INTERDITS):
+            log(f"   {comp['nom']} : exclu (Italie)")
+            continue
+        brut = [ev for ev in src.cotes(comp) if now <= ev["start"] <= fin and ev["betclic"]["h2h"]]
+        if comp.get("ldc") and EXCLURE_ITALIENS_LDC:
+            brut = [ev for ev in brut if not (est_italien(ev["home"]) or est_italien(ev["away"]))]
+        clubs, txt = perimetre(comp, src, now) if comp["cat"] == "FOOT" else (None, "tous les matchs")
+        evs = [ev for ev in brut if garder_match(ev, clubs)]
+        src.perimetre.append((comp["nom"], txt))
+        log(f"   {comp['nom']} : {len(evs)} match(s) retenu(s) sur {len(brut)} · {txt}")
         if evs:
             evenements[comp["id"]] = (comp, evs)
 
