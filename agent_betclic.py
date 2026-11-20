@@ -387,9 +387,15 @@ class SourcesReelles:
         """Résultats NBA jour par jour via le tableau des scores ESPN (saison passée + en cours), avec cache."""
         CACHE_DIR.mkdir(exist_ok=True)
         f_res, f_jours = CACHE_DIR / "espn_nba.csv", CACHE_DIR / "espn_nba_jours.txt"
-        res = pd.read_csv(f_res) if f_res.exists() else pd.DataFrame(columns=["jour", "home", "away", "hpts", "apts"])
+        res = (pd.read_csv(f_res, dtype={"jour": str, "eid": str}) if f_res.exists()
+               else pd.DataFrame(columns=["jour", "home", "away", "hpts", "apts", "eid"]))
+        if "eid" not in res.columns:
+            res["eid"] = np.nan
         faits = set(f_jours.read_text().split()) if f_jours.exists() else set()
         hier = now.astimezone(TZ).date() - timedelta(days=1)
+        recents = {f"{hier - timedelta(days=k):%Y%m%d}" for k in range(16)}   # feuilles de match utiles : 15 jours
+        sans_id = set(res.loc[res["eid"].isna(), "jour"].astype(str)) & recents
+        faits -= sans_id
         y0 = now.year if now.month >= 9 else now.year - 1
         jour, a_faire = datetime(y0 - 1, 10, 15).date(), []
         while jour <= hier:
@@ -418,7 +424,8 @@ class SourcesReelles:
                     eq = {c.get("homeAway"): c for c in ev["competitions"][0]["competitors"]}
                     nouveaux.append({"jour": cle, "home": eq["home"]["team"]["displayName"],
                                      "away": eq["away"]["team"]["displayName"],
-                                     "hpts": int(float(eq["home"]["score"])), "apts": int(float(eq["away"]["score"]))})
+                                     "hpts": int(float(eq["home"]["score"])), "apts": int(float(eq["away"]["score"])),
+                                     "eid": str(ev.get("id", ""))})
                 faits.add(cle)
             except Exception:
                 echecs += 1
@@ -434,6 +441,113 @@ class SourcesReelles:
         g["date"] = pd.to_datetime(g["jour"].astype(str), format="%Y%m%d")
         g["season"] = np.where(g["date"].dt.month >= 9, g["date"].dt.year, g["date"].dt.year - 1)
         return g[["date", "home", "away", "hpts", "apts", "season"]].sort_values("date").reset_index(drop=True)
+
+    # ---- joueurs NBA : match par match (nba_api en un appel, sinon feuilles de match ESPN) ----
+    def joueurs_nba(self, now):
+        df = self._joueurs_nba_api(now)
+        if df is None:
+            df = self._joueurs_nba_espn(now)
+        if df is None:
+            self.echecs.append("Joueurs NBA (nba_api et feuilles de match ESPN indisponibles)")
+        return df
+
+    def _joueurs_nba_api(self, now):
+        try:
+            from nba_api.stats.endpoints import leaguegamelog
+        except Exception:
+            return None
+        y0 = now.year if now.month >= 9 else now.year - 1
+        saison = f"{y0}-{str(y0 + 1)[2:]}"
+        f = CACHE_DIR / f"nba_joueurs_{saison}.csv"
+        if f.exists() and time.time() - f.stat().st_mtime < 6 * 3600:
+            d = pd.read_csv(f)
+        else:
+            try:
+                d = avec_delai(lambda: leaguegamelog.LeagueGameLog(
+                    season=saison, season_type_all_star="Regular Season", player_or_team_abbreviation="P",
+                    timeout=25).get_data_frames()[0], 40)
+            except Exception:
+                d = None
+            if d is None or len(d) == 0:
+                return None
+            CACHE_DIR.mkdir(exist_ok=True)
+            d.to_csv(f, index=False)
+
+        def minutes(x):
+            x = str(x)
+            if ":" in x:
+                mm, ss = x.split(":")[:2]
+                return float(mm) + float(ss) / 60
+            try:
+                return float(x)
+            except ValueError:
+                return 0.0
+        try:
+            return pd.DataFrame({"joueur": d["PLAYER_NAME"], "equipe": d["TEAM_NAME"],
+                                 "date": pd.to_datetime(d["GAME_DATE"]), "min": d["MIN"].map(minutes), "pts": d["PTS"],
+                                 "reb": d["REB"], "ast": d["AST"], "poste": ""})
+        except (KeyError, ValueError) as ex:          # format inattendu : on passe aux feuilles de match ESPN
+            log(f"   nba_api joueurs : format inattendu ({ex}), passage à ESPN")
+            return None
+
+    def _joueurs_nba_espn(self, now):
+        g = self.games_nba(now)                       # remplit le cache ESPN (avec les identifiants de match)
+        f_res = CACHE_DIR / "espn_nba.csv"
+        if not f_res.exists():
+            return None
+        res = pd.read_csv(f_res, dtype={"eid": str, "jour": str})
+        hier = now.astimezone(TZ).date() - timedelta(days=1)
+        debut = f"{hier - timedelta(days=15):%Y%m%d}"
+        res = res[(res["jour"] >= debut) & res["eid"].notna() & (res["eid"] != "")].drop_duplicates(subset=["eid"])
+        rows, dossier, t0 = [], CACHE_DIR / "espn_box", time.time()
+        dossier.mkdir(parents=True, exist_ok=True)
+        for r in res.itertuples():
+            eid = str(r.eid).split(".")[0]
+            f = dossier / f"{eid}.json"
+            if f.exists():
+                data = json.loads(f.read_text(encoding="utf-8"))
+            else:
+                if time.time() - t0 > 240:
+                    break
+                rep = http_get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary",
+                               params={"event": eid}, timeout=20, retries=1)
+                if rep is None:
+                    continue
+                try:
+                    data = rep.json().get("boxscore", {})
+                except ValueError:
+                    continue
+                f.write_text(json.dumps(data), encoding="utf-8")
+                time.sleep(0.15)
+            rows += lire_feuille_espn(data, r.jour)
+        return pd.DataFrame(rows) if rows else None
+
+    # ---- joueurs foot : forme et statistiques de la saison ----
+    def joueurs_foot(self, comp, now):
+        if comp["id"] == "soccer_epl" and self.fpl() is not None:
+            j = self.fpl()
+            return j[j["time"] > 0].rename(columns={"team": "equipe", "time": "minutes", "games": "titularisations",
+                                                    "goals": "buts"}).assign(mj=lambda x: x["titularisations"])
+        ligue = LIGUES_APIFOOT.get(comp["id"])
+        if not (ligue and self.apifoot.ok):
+            return None
+        par_nom = {}
+        for it in self.apifoot.meilleurs_buteurs(ligue, now) + self.apifoot.meilleurs_passeurs(ligue, now):
+            try:
+                st, pl = it["statistics"][0], it["player"]
+                cle = (pl["name"], st["team"]["name"])
+                par_nom[cle] = {"joueur": pl["name"], "equipe": st["team"]["name"], "age": pl.get("age"),
+                                "nationalite": pl.get("nationality") or "",
+                                "poste": {"Attacker": "Attaquant", "Midfielder": "Milieu", "Defender": "Défenseur",
+                                          "Goalkeeper": "Gardien"}.get(st["games"].get("position"), ""),
+                                "mj": float(st["games"].get("appearences") or 0),
+                                "minutes": float(st["games"].get("minutes") or 0),
+                                "buts": float(st["goals"].get("total") or 0),
+                                "passes": float(st["goals"].get("assists") or 0),
+                                "note": float(st["games"].get("rating") or 0)}
+            except Exception:
+                continue
+        return pd.DataFrame(list(par_nom.values())) if par_nom else None
 
     def blessures_nba(self):
         out = {}
@@ -735,6 +849,44 @@ class SourcesDemo:
                 rows.append((f"Attaquant {r + 1} {c}", c, g, t, int(self.rng.poisson(xg)), xg))
         return pd.DataFrame(rows, columns=["joueur", "team", "games", "time", "goals", "xG"])
 
+    def joueurs_nba(self, now):
+        """Joueurs simulés : 8 par équipe, 12 matchs ; quelques-uns en forte hausse."""
+        rng, rows = np.random.default_rng(5), []
+        prenoms = ["Jalen", "Tyrese", "Marcus", "Darius", "Isaiah", "Keldon", "Jaden", "Malik"]
+        for t, team in enumerate(self.NBA):
+            for k in range(8):
+                base_pts = [26, 19, 14, 11, 9, 7, 6, 5][k] * rng.uniform(0.8, 1.2)
+                base_reb = [6, 8, 5, 4, 7, 3, 4, 2][k] * rng.uniform(0.8, 1.2)
+                base_ast = [6, 3, 4, 2, 2, 3, 1, 1][k] * rng.uniform(0.8, 1.2)
+                hausse = 1.6 if (t + k) % 23 == 4 else 1.25 if k == 0 and t % 5 == 0 else 1.0
+                for j in range(12):
+                    f = hausse if j >= 7 else 1.0
+                    rows.append({"joueur": f"{prenoms[k]} {team.split()[-1]} (démo)", "equipe": team,
+                                 "date": pd.Timestamp("2026-11-19") - pd.Timedelta(days=2 * (11 - j)),
+                                 "min": [35, 32, 29, 26, 24, 22, 18, 14][k] * (1.15 if f > 1.3 else 1.0),
+                                 "pts": max(0, rng.normal(base_pts * f, 4)), "reb": max(0, rng.normal(base_reb * f, 2)),
+                                 "ast": max(0, rng.normal(base_ast * f, 1.5)), "poste": ["PG", "SF", "SG", "PF", "C", "G", "F", "C"][k]})
+        return pd.DataFrame(rows).round({"pts": 0, "reb": 0, "ast": 0})
+
+    def joueurs_foot(self, comp, now):
+        div = comp.get("div")
+        if div not in self.CLUBS:
+            return None
+        rng, rows = np.random.default_rng(len(div) * 7), []
+        nats = ["France", "Espagne", "Angleterre", "Brésil", "Allemagne", "Portugal", "Argentine", "Maroc"]
+        for i, club in enumerate(self.CLUBS[div]):
+            for k, poste in enumerate(["Attaquant", "Attaquant", "Milieu", "Milieu"]):
+                mj = int(rng.integers(8, 13))
+                minutes = mj * rng.uniform(55, 88)
+                g90 = [0.6, 0.35, 0.2, 0.12][k] * rng.uniform(0.6, 1.4) * (1.3 if i < 4 else 1.0)
+                a90 = [0.15, 0.2, 0.25, 0.15][k] * rng.uniform(0.6, 1.4)
+                rows.append({"joueur": f"Joueur {k + 1} {club} (démo)", "equipe": self.ODDS_NAMES.get(club, club),
+                             "age": int(rng.integers(18, 33)), "nationalite": nats[(i + k) % len(nats)], "poste": poste,
+                             "mj": mj, "minutes": minutes, "buts": round(g90 * minutes / 90), "passes": round(a90 * minutes / 90),
+                             "note": 7.0, "forme": float(rng.uniform(2, 9)) if div == "E0" else 0.0,
+                             "popularite": float(rng.uniform(1, 30)) if div == "E0" else None})
+        return pd.DataFrame(rows)
+
     def actus(self, items, now):
         return {items[1]["id"]: {"alerte": True, "resume": "Démo : avant-centre titulaire incertain (cuisse)"}} \
             if len(items) > 1 else {}
@@ -933,6 +1085,9 @@ class APIFoot:
     def meilleurs_buteurs(self, ligue, now):
         return self.get("/players/topscorers", {"league": ligue, "season": saison_foot(now)}, ttl_h=24) or []
 
+    def meilleurs_passeurs(self, ligue, now):
+        return self.get("/players/topassists", {"league": ligue, "season": saison_foot(now)}, ttl_h=24) or []
+
     def compos(self, fixture_id):
         # une compo pas encore publiée n'est pas mise en cache : on redemande au prochain contrôle
         return self.get("/fixtures/lineups", {"fixture": fixture_id}, ttl_h=6, garder_vide=False) or []
@@ -993,7 +1148,10 @@ def fpl_joueurs():
                  "team": equipes.get(p["team"], ""), "statut": p.get("status", "a"),
                  "chance": p.get("chance_of_playing_next_round"), "news": p.get("news", ""),
                  "time": float(p.get("minutes") or 0), "games": float(p.get("starts") or 0),
-                 "goals": float(p.get("goals_scored") or 0), "xG": float(p.get("expected_goals") or 0)}
+                 "goals": float(p.get("goals_scored") or 0), "xG": float(p.get("expected_goals") or 0),
+                 "passes": float(p.get("assists") or 0), "xA": float(p.get("expected_assists") or 0),
+                 "forme": float(p.get("form") or 0), "popularite": float(p.get("selected_by_percent") or 0),
+                 "poste": {1: "Gardien", 2: "Défenseur", 3: "Milieu", 4: "Attaquant"}.get(p.get("element_type"), "")}
                 for p in d["elements"]]
         return pd.DataFrame(rows)
     except Exception as e:
@@ -2081,6 +2239,201 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
 
 
 # =============================================================================
+# JOUEURS EN FORME ET PÉPITES (onglet « Joueurs » de l'appli)
+# =============================================================================
+STATS_NBA = (("pts", "points", 10), ("reb", "rebonds", 5), ("ast", "passes décisives", 4))
+
+
+def lire_feuille_espn(box, jour):
+    """Une feuille de match ESPN -> une ligne par joueur ayant joué (minutes, points, rebonds, passes)."""
+    rows = []
+    for eq in (box or {}).get("players", []):
+        nom_eq = (eq.get("team") or {}).get("displayName", "")
+        for bloc in eq.get("statistics", []):
+            noms = [str(x).upper() for x in (bloc.get("names") or bloc.get("labels") or [])]
+            if not all(k in noms for k in ("MIN", "PTS", "REB", "AST")):
+                continue
+            i = {k: noms.index(k) for k in ("MIN", "PTS", "REB", "AST")}
+            for a in bloc.get("athletes", []):
+                st = a.get("stats") or []
+                if a.get("didNotPlay") or len(st) < len(noms):
+                    continue
+                try:
+                    val = {k: float(str(st[j]).split(":")[0]) for k, j in i.items()}
+                except ValueError:
+                    continue
+                ath = a.get("athlete") or {}
+                rows.append({"joueur": ath.get("displayName", ""), "equipe": nom_eq,
+                             "date": pd.to_datetime(str(jour), format="%Y%m%d"), "min": val["MIN"], "pts": val["PTS"],
+                             "reb": val["REB"], "ast": val["AST"],
+                             "poste": (ath.get("position") or {}).get("abbreviation", "")})
+    return rows
+
+
+def prochain_match(equipe, matchs):
+    for m in sorted(matchs, key=lambda x: x["start"]):
+        for cote, autre in (("home", "away"), ("away", "home")):
+            if canon(m[cote]) == canon(equipe) or match_team(equipe, [m[cote]]):
+                return m, m[autre]
+    return None, None
+
+
+def seuil_fiable(valeurs, mini_taux=0.7):
+    """La ligne x,5 la plus haute franchie au moins 7 fois sur 10 sur les derniers matchs."""
+    v = [float(x) for x in valeurs]
+    if len(v) < 5:
+        return None
+    for ligne in np.arange(math.floor(max(v)) + 0.5, -0.5, -1.0):
+        n = sum(x > ligne for x in v)
+        if n / len(v) >= mini_taux:
+            return {"ligne": float(ligne), "n": n, "sur": len(v), "taux": n / len(v)}
+    return None
+
+
+POSTES_NBA = {"G": "meneur ou arrière", "PG": "meneur", "SG": "arrière", "F": "ailier", "SF": "ailier",
+              "PF": "ailier fort", "C": "pivot", "G-F": "arrière ou ailier", "F-C": "ailier fort ou pivot"}
+
+
+def joueurs_nba_forme(df, matchs_b, n_forme=4):
+    """Joueurs NBA en grande forme (points + rebonds + passes sur 5 matchs) et une pépite (joueur de rôle en hausse)."""
+    nba = [m for m in matchs_b if m["comp"] == "NBA"]
+    if df is None or df.empty or not nba:
+        return None
+    equipes = {canon(m[c]) for m in nba for c in ("home", "away")}
+    cands = []
+    for (nom, eq), g in df.sort_values("date").groupby(["joueur", "equipe"]):
+        if canon(eq) not in equipes and not any(match_team(eq, [m[c]]) for m in nba for c in ("home", "away")):
+            continue
+        if len(g) < 6:
+            continue
+        d5, d10 = g.tail(5), g.tail(10)
+        if d5["min"].mean() < 20:
+            continue
+        pra5 = d5[["pts", "reb", "ast"]].sum(axis=1).mean()
+        pra_s = g[["pts", "reb", "ast"]].sum(axis=1).mean()
+        m, adv = prochain_match(eq, nba)
+        if m is None:
+            continue
+        paris = []
+        for col, nom_stat, seuil_min in STATS_NBA:
+            if d10[col].mean() < seuil_min:
+                continue
+            sf = seuil_fiable(d10[col].tolist())
+            if sf and sf["ligne"] >= seuil_min - 0.5:
+                paris.append({"stat": nom_stat, **sf})
+        cands.append({"joueur": nom, "equipe": eq, "poste": POSTES_NBA.get(str(g["poste"].iloc[-1]), ""),
+                      "n_matchs": len(g), "match": m, "adversaire": adv,
+                      "r5": {k: d5[k].mean() for k in ("pts", "reb", "ast", "min")},
+                      "rs": {k: g[k].mean() for k in ("pts", "reb", "ast", "min")},
+                      "pra5": pra5, "ratio": pra5 / pra_s if pra_s else 1, "paris": paris})
+    if not cands:
+        return None
+    forme = sorted([c for c in cands if c["pra5"] >= 25 and c["ratio"] >= 1.0],
+                   key=lambda c: -c["pra5"] * min(c["ratio"], 1.4))[:n_forme]
+    deja = {c["joueur"] for c in forme}
+    pepites = sorted([c for c in cands if c["rs"]["pts"] < 15 and c["ratio"] >= 1.2 and c["r5"]["min"] >= 22
+                      and c["joueur"] not in deja and c["paris"]], key=lambda c: -c["ratio"])
+    return {"forme": forme, "pepite": pepites[0] if pepites else None}
+
+
+def joueurs_foot_forme(dfs, matchs_f, n_forme=4):
+    """Joueurs de foot en forme (buts + passes par 90 min, forme récente en Angleterre) et une pépite (jeune ou peu attendu)."""
+    cands = []
+    for comp_nom, df in dfs.items():
+        if df is None or df.empty:
+            continue
+        ms = [m for m in matchs_f if m["comp"] == comp_nom]
+        for r in df.itertuples():
+            if r.minutes < 450 or r.buts + r.passes < 2:
+                continue
+            m, adv = prochain_match(r.equipe, ms)
+            if m is None:
+                continue
+            g90, a90 = r.buts * 90 / r.minutes, r.passes * 90 / r.minutes
+            mj = max(1.0, float(getattr(r, "mj", 0) or 0))
+            min_match = min(90.0, r.minutes / mj)
+            p_but = 1 - math.exp(-g90 * 0.85 * min_match / 90)
+            p_passe = 1 - math.exp(-a90 * 0.85 * min_match / 90)
+            forme_fpl = float(getattr(r, "forme", 0) or 0)
+            cands.append({"joueur": r.joueur, "equipe": r.equipe, "comp": comp_nom, "match": m, "adversaire": adv,
+                          "age": getattr(r, "age", None), "nationalite": getattr(r, "nationalite", "") or "",
+                          "poste": getattr(r, "poste", "") or "", "buts": int(r.buts), "passes": int(r.passes),
+                          "minutes": int(r.minutes), "mj": int(mj), "g90": g90, "a90": a90, "forme_fpl": forme_fpl,
+                          "popularite": getattr(r, "popularite", None), "p_but": p_but, "p_passe": p_passe,
+                          "score": (g90 + a90) * (1 + forme_fpl / 10)})
+    if not cands:
+        return None
+    forme = sorted(cands, key=lambda c: -c["score"])[:n_forme]
+    deja = {c["joueur"] for c in forme}
+    reste = [c for c in cands if c["joueur"] not in deja]
+    jeunes = [c for c in reste if c["age"] and not pd.isna(c["age"]) and int(c["age"]) <= 21 and c["g90"] + c["a90"] >= 0.3]
+    peu_vus = [c for c in reste if c["popularite"] is not None and not pd.isna(c["popularite"])
+               and c["popularite"] < 5 and c["forme_fpl"] >= 5]
+    pepite = (max(jeunes, key=lambda c: c["score"]) if jeunes else max(peu_vus, key=lambda c: c["score"]) if peu_vus
+              else (min(reste, key=lambda c: c["minutes"]) if reste else None))
+    return {"forme": forme, "pepite": pepite}
+
+
+def joueurs_semaine(src, matchs_f, matchs_b, now):
+    """Données de l'onglet Joueurs : NBA et foot. Ne bloque jamais le bilan."""
+    out = {"nba": None, "foot": None}
+    try:
+        if any(m["comp"] == "NBA" for m in matchs_b) and hasattr(src, "joueurs_nba"):
+            out["nba"] = joueurs_nba_forme(src.joueurs_nba(now), matchs_b)
+    except Exception as ex:
+        log(f"   Joueurs NBA indisponibles ({ex})")
+    try:
+        if hasattr(src, "joueurs_foot"):
+            dfs = {}
+            for c in COMPETITIONS:
+                if c["cat"] == "FOOT" and any(m["comp"] == c["nom"] for m in matchs_f):
+                    dfs[c["nom"]] = src.joueurs_foot(c, now)
+            out["foot"] = joueurs_foot_forme(dfs, matchs_f)
+    except Exception as ex:
+        log(f"   Joueurs foot indisponibles ({ex})")
+    return out
+
+
+# ---- présentation (faits uniquement : poste, âge, nationalité, chiffres) ----
+def phrase_nba(c, pepite=False) -> str:
+    r5, rs = c["r5"], c["rs"]
+    qui = (f'{c["joueur"]}, {c["poste"]} des {c["equipe"]},' if c["poste"] else f'{c["joueur"]} ({c["equipe"]})')
+    tendance = (f'contre {fr(rs["pts"], 1)} points en moyenne sur ses {c["n_matchs"]} matchs relevés'
+                if abs(r5["pts"] - rs["pts"]) >= 0.5 else "au niveau de sa moyenne")
+    debut = (f'{qui} monte en puissance : ' if pepite else f'{qui} tourne à ')
+    return (f'{debut}{fr(r5["pts"], 1)} points, {fr(r5["reb"], 1)} rebonds et {fr(r5["ast"], 1)} passes sur ses '
+            f'5 derniers matchs, en {fr(r5["min"], 0)} minutes, {tendance}.')
+
+
+NATIONALITES = {"France": "Français", "Spain": "Espagnol", "England": "Anglais", "Germany": "Allemand",
+                "Brazil": "Brésilien", "Argentina": "Argentin", "Portugal": "Portugais", "Netherlands": "Néerlandais",
+                "Belgium": "Belge", "Italy": "Italien", "Norway": "Norvégien", "Morocco": "Marocain",
+                "Senegal": "Sénégalais", "Ivory Coast": "Ivoirien", "Côte d'Ivoire": "Ivoirien", "Algeria": "Algérien",
+                "Uruguay": "Uruguayen", "Colombia": "Colombien", "Croatia": "Croate", "Denmark": "Danois",
+                "Sweden": "Suédois", "Poland": "Polonais", "Switzerland": "Suisse", "Austria": "Autrichien",
+                "Scotland": "Écossais", "Wales": "Gallois", "Nigeria": "Nigérian", "Ghana": "Ghanéen",
+                "Cameroon": "Camerounais", "Egypt": "Égyptien", "Japan": "Japonais", "South Korea": "Sud-Coréen",
+                "USA": "Américain", "United States": "Américain", "Georgia": "Géorgien", "Turkey": "Turc",
+                "Serbia": "Serbe", "Ukraine": "Ukrainien", "Ecuador": "Équatorien", "Mexico": "Mexicain"}
+
+
+def phrase_foot(c) -> str:
+    bits = [c["joueur"]]
+    if c["age"] and not pd.isna(c["age"]):
+        bits.append(f'{int(c["age"])} ans')
+    if c["nationalite"]:
+        bits.append(NATIONALITES.get(c["nationalite"], c["nationalite"]))
+    qui = ", ".join(bits)
+    role = f'{c["poste"].lower()} de {c["equipe"]}' if c["poste"] else f'joueur de {c["equipe"]}'
+    par_but = f', soit un but toutes les {round(c["minutes"] / c["buts"])} minutes' if c["buts"] else ""
+    forme = f' Sa note de forme Fantasy est de {fr(c["forme_fpl"], 1)}.' if c["forme_fpl"] else ""
+    pl = lambda n, mot: f"{n} {mot}" + ("s" if n > 1 else "")
+    return (f'{qui}, {role} : {pl(c["buts"], "but")} et {pl(c["passes"], "passe")} '
+            f'décisive{"s" if c["passes"] > 1 else ""} en {c["mj"]} matchs cette saison'
+            f'{par_but}.{forme}')
+
+
+# =============================================================================
 # L'APPLI « MES PARIS » (page de l'icône) : onglets, camemberts, ticket récapitulatif
 # =============================================================================
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
@@ -2174,6 +2527,22 @@ color:var(--encre);margin:6px 6px 0 0;cursor:pointer}
 .barre.choix .p i{background:var(--rouge)}
 .barre .v{width:38px;text-align:right;color:var(--encre)}
 .vide{color:var(--ardoise);font-size:16px;margin:28px 0}
+.joueur{background:var(--blanc);border:1px solid var(--trait);border-radius:12px;margin:12px 0;overflow:hidden}
+.joueur.pepite{border-left:4px solid var(--rouge)}
+.joueur .tete-j{display:flex;gap:12px;align-items:center;padding:14px 14px 0}
+.avatar{flex:0 0 auto;width:44px;height:44px;border-radius:50%;background:var(--encre);color:#fff;display:grid;place-items:center;
+font:700 17px var(--cond)}
+.pepite .avatar{background:var(--rouge)}
+.joueur .bio{padding:10px 14px 0;font-size:14px;color:var(--ardoise)}
+.duo{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 14px}
+.duo>div{background:var(--fond);border-radius:8px;padding:8px 6px;text-align:center}
+.duo .v{font:700 22px/1 var(--cond)}
+.duo .l{font-size:12px;color:var(--ardoise);margin-top:3px}
+.duo .avant{font-size:12px;color:var(--ardoise)}
+.duo .haut{color:var(--rouge)}
+.sugg{display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid var(--trait)}
+.sugg .corps .sel{font-size:16px}
+.etiquette{font:600 15px var(--cond);color:var(--rouge);margin:0 0 2px}
 .liens{margin:28px 0 0;display:flex;gap:18px;flex-wrap:wrap}
 .liens a{color:var(--rouge);font-weight:600;text-decoration:none}
 .pied{color:var(--ardoise);font-size:13px;margin:26px 0 0}
@@ -2298,8 +2667,8 @@ def donut(p, taille=54, ep=7, texte=None, label=""):
             f'<text x="{c}" y="{c + taille * 0.09:.1f}" text-anchor="middle" style="font-size:{taille * 0.24:.1f}px">{e(t)}</text></svg>')
 
 
-def donut_parts(parts, taille=58, ep=9, label=""):
-    """Camembert en anneau à plusieurs parts : [(valeur, couleur), ...]."""
+def donut_parts(parts, taille=64, ep=9, label="", texte=""):
+    """Camembert en anneau à plusieurs parts : [(valeur, couleur), ...], avec un texte au centre."""
     tot = sum(v for v, _ in parts) or 1
     r = (taille - ep) / 2
     circ = 2 * math.pi * r
@@ -2312,7 +2681,9 @@ def donut_parts(parts, taille=58, ep=9, label=""):
         deb += lg
     return (f'<svg class="donut" width="{taille}" height="{taille}" viewBox="0 0 {taille} {taille}" role="img" '
             f'aria-label="{e(label)}"><circle cx="{c}" cy="{c}" r="{r:.2f}" fill="none" stroke="#F7F7F8" '
-            f'stroke-width="{ep}"/>{arcs}</svg>')
+            f'stroke-width="{ep}"/>{arcs}'
+            + (f'<text x="{c}" y="{c + taille * 0.09:.1f}" text-anchor="middle" style="font-size:{taille * 0.24:.1f}px">'
+               f'{e(texte)}</text>' if texte else "") + '</svg>')
 
 
 def item_attr(item) -> str:
@@ -2370,16 +2741,23 @@ def fiche_match(m) -> str:
         niv = niveau_mot(s["badge"])
         if foot:
             v, n, d = (int(x) for x in s["VND"].split("-"))
-            cam = donut_parts([(v, "#C1121F"), (n, "#A1A1AA"), (d, "#D4D4D8")],
-                              label=f"{v} victoires, {n} nuls, {d} défaites")
-            leg = f'<div class="legende"><b style="color:#C1121F">{v} V</b>, {n} N, {d} D<br>sur {s["MJ"]} matchs</div>'
+            t = max(1, v + n + d)
+            pv, pn, pd = round(100 * v / t), round(100 * n / t), round(100 * d / t)
+            cam = donut_parts([(v, "#C1121F"), (n, "#A1A1AA"), (d, "#D4D4D8")], texte=f"{pv}%",
+                              label=f"{pv} % de victoires, {pn} % de nuls, {pd} % de défaites")
+            leg = (f'<div class="legende"><b style="color:#C1121F">{pv} % victoires</b><br>{pn} % nuls<br>'
+                   f'{pd} % défaites<br>sur {s["MJ"]} matchs</div>')
             stats = (f'<div class="stat">Buts marqués <b>{fr(s["BM"], 1)}</b>, encaissés <b>{fr(s["BE"], 1)}</b> par match</div>'
                      f'<div class="stat">Plus de 2,5 buts <b>{pc(s["O25"])}</b>, les 2 marquent <b>{pc(s["BTTS"])}</b></div>'
                      f'<div class="stat">Victoires à domicile <b>{pc(s["pV_dom"])}</b>, à l\'extérieur <b>{pc(s["pV_ext"])}</b></div>')
         else:
             v, d = (int(x) for x in s["VD"].split("-"))
-            cam = donut_parts([(v, "#C1121F"), (d, "#D4D4D8")], label=f"{v} victoires, {d} défaites")
-            leg = f'<div class="legende"><b style="color:#C1121F">{v} V</b>, {d} D<br>sur {s["MJ"]} matchs</div>'
+            t = max(1, v + d)
+            pv, pd = round(100 * v / t), round(100 * d / t)
+            cam = donut_parts([(v, "#C1121F"), (d, "#D4D4D8")], texte=f"{pv}%",
+                              label=f"{pv} % de victoires, {pd} % de défaites")
+            leg = (f'<div class="legende"><b style="color:#C1121F">{pv} % victoires</b><br>{pd} % défaites<br>'
+                   f'{v}-{d} sur {s["MJ"]} matchs</div>')
             b2b = '<div class="alerte">2e match en 2 jours</div>' if s.get("repos") == 1 else ""
             stats = (f'<div class="stat">Points marqués <b>{fr(s["PM"], 1)}</b>, encaissés <b>{fr(s["PE"], 1)}</b></div>'
                      f'<div class="stat">Écart moyen <b>{fr(s["net"], 1)}</b></div>{b2b}')
@@ -2401,6 +2779,76 @@ def fiche_match(m) -> str:
             f'<div class="qui">{e(m["comp"])}, {quand_court(m["start"])}{attendus}</div>'
             f'<div class="equipes">{equipe(m["home"], m.get("stats_h"))}{equipe(m["away"], m.get("stats_a"))}</div>'
             f'<div class="puces" aria-label="Cotes Betclic, à cocher">{puces}</div>{notes}</article>')
+
+
+def initiales(nom) -> str:
+    mots = [m for m in re.split(r"[\s\-]+", str(nom)) if m and m[0].isalpha()]
+    return (mots[0][0] + (mots[-1][0] if len(mots) > 1 else "")).upper() if mots else "?"
+
+
+def ligne_suggestion(item, texte, detail, p, mini) -> str:
+    return (f'<div class="sugg">{donut(p, taille=40, ep=5, label=f"{pc(p)}")}<div class="corps"><div class="sel">{e(texte)}</div>'
+            f'<div class="note">{detail}, joue si la cote est d\'au moins <b>{fr(mini)}</b></div></div>{bouton_pick(item)}</div>')
+
+
+def carte_joueur(c, sport, pepite=False) -> str:
+    m = c["match"]
+    match_txt = f'{m["home"]} – {m["away"]}'
+    base = {"match": match_txt, "quand": quand_court(m["start"]), "cote": None, "mid": str(m["id"])}
+    if sport == "nba":
+        r5, rs = c["r5"], c["rs"]
+
+        def case(k, lib):
+            haut = " haut" if r5[k] > rs[k] * 1.1 else ""
+            return (f'<div><div class="v{haut}">{fr(r5[k], 1)}</div><div class="l">{lib}</div>'
+                    f'<div class="avant">moy. {fr(rs[k], 1)}</div></div>')
+        chiffres = case("pts", "points") + case("reb", "rebonds") + case("ast", "passes")
+        sugg = ""
+        for x in c["paris"]:
+            mini = round(1.1 / x["taux"], 2)
+            texte = f'Plus de {fr(x["ligne"], 1)} {x["stat"]}'
+            item = {**base, "id": f'prop|{c["joueur"]}|{x["stat"]}|{x["ligne"]}', "sel": f'{c["joueur"]} : {texte.lower()}',
+                    "mini": mini, "p": round(x["taux"], 3)}
+            sugg += ligne_suggestion(item, texte, f'Passé {x["n"]} fois sur ses {x["sur"]} derniers matchs', x["taux"], mini)
+        bio = phrase_nba(c, pepite)
+    else:
+        chiffres = (f'<div><div class="v">{c["buts"]}</div><div class="l">buts</div></div>'
+                    f'<div><div class="v">{c["passes"]}</div><div class="l">passes déc.</div></div>'
+                    f'<div><div class="v">{fr(c["g90"] + c["a90"], 2)}</div><div class="l">buts + passes / 90 min</div></div>')
+        sugg = ""
+        for cle, lib, p in (("but", "buteur", c["p_but"]), ("passe", "passeur décisif", c["p_passe"])):
+            if p < 0.15:
+                continue
+            mini = round(1.1 / p, 2)
+            item = {**base, "id": f'foot|{c["joueur"]}|{cle}', "sel": f'{c["joueur"]} {lib}', "mini": mini, "p": round(p, 3)}
+            sugg += ligne_suggestion(item, f'{c["joueur"]} {lib}', f'{pc(p)} de chance s\'il joue', p, mini)
+        bio = phrase_foot(c)
+    etiquette = '<div class="etiquette">La pépite de la semaine</div>' if pepite else ""
+    return (f'<article class="joueur{" pepite" if pepite else ""}"><div class="tete-j"><div class="avatar" aria-hidden="true">'
+            f'{e(initiales(c["joueur"]))}</div><div class="corps">{etiquette}<div class="sel">{e(c["joueur"])}</div>'
+            f'<div class="qui">{e(c["equipe"])}, contre {e(c["adversaire"])}, {quand_court(m["start"])}</div></div></div>'
+            f'<div class="bio">{e(bio)}</div><div class="duo">{chiffres}</div>{sugg}</article>')
+
+
+def onglet_joueurs(js) -> tuple[str, int]:
+    if not js:
+        return "", 0
+    h, n = "", 0
+    for sport, titre_s, aide in (
+            ("nba", "Basket : en grande forme", "Points, rebonds et passes sur les 5 derniers matchs, comparés à leur moyenne. "
+             "Les seuils sont ceux qu'ils ont dépassés au moins 7 fois sur 10 : compare-les aux lignes Betclic."),
+            ("foot", "Foot : en grande forme", "Buts et passes décisives de la saison rapportés au temps de jeu.")):
+        d = js.get(sport)
+        if not d or not (d["forme"] or d["pepite"]):
+            continue
+        h += f"<h2>{titre_s}</h2><p class=\"aide\">{aide}</p>"
+        if d["pepite"]:
+            h += carte_joueur(d["pepite"], sport, pepite=True)
+            n += 1
+        for c in d["forme"]:
+            h += carte_joueur(c, sport)
+            n += 1
+    return h, n
 
 
 def page_onglets(v) -> str:
@@ -2493,7 +2941,12 @@ def page_onglets(v) -> str:
     if ldc_m:
         onglets.append(("ldc", "Ligue des Champions", len(ldc_m),
                         (bloc_combines(ldc_g) if ldc_g else "") + titre("Les matchs") + "".join(fiche_match(m) for m in ldc_m)))
-    onglets += [("buteurs", "Buteurs", len(buteurs), but),
+    html_j, n_j = onglet_joueurs(syn.get("joueurs"))
+    onglets += [("buteurs", "Buteurs", len(buteurs), but)]
+    if n_j:
+        onglets.append(("joueurs", "Joueurs", n_j, html_j + '<p class="aide" style="margin-top:16px">Les seuils et chances '
+                        'viennent des matchs passés : ils ne garantissent rien. Vérifie que le joueur est bien titulaire.</p>'))
+    onglets += [
                 ("matchs", "Matchs", len(autres), (titre("Championnats", "Forme, bilan de la saison et cotes à cocher.")
                                                    + "".join(fiche_match(m) for m in autres)) if autres else vide("Aucun match."))]
     if matchs_b:
@@ -3278,6 +3731,8 @@ def main():
     base = "demo" if args.demo else f"{now.astimezone(TZ):%Y%m%d_%H%M}"
     (OUT_DIR / f"rapport_{base}.html").write_text(page, encoding="utf-8")
     syn = synthese(matchs_f, matchs_b)
+    log("   Joueurs en forme et pépites")
+    syn["joueurs"] = joueurs_semaine(src, matchs_f, matchs_b, now)
     if not args.demo:
         sauver_conseils(matchs_f, syn, now)
     pdf = OUT_DIR / f"Bilan_Betclic_{now.astimezone(TZ):%d-%m-%Y}{'_demo' if args.demo else ''}.pdf"
