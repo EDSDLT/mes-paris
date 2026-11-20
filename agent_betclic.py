@@ -51,6 +51,7 @@ from modele_foot_nba import DixonColes, NBAElo, devig_power, markets, score_grid
 # CONFIGURATION (modifiable par variables d'environnement)
 # =============================================================================
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -122,6 +123,8 @@ ALIASES_RAW = {
     "FC Barcelona": "Barcelona", "Barça": "Barcelona", "Bayern München": "Bayern Munich",
     "FC Bayern Munich": "Bayern Munich", "FC Bayern München": "Bayern Munich", "Real Madrid CF": "Real Madrid",
     "Club Atlético de Madrid": "Ath Madrid", "Atletico de Madrid": "Ath Madrid",
+    "Man Utd": "Man United", "Spurs": "Tottenham", "Nottingham": "Nott'm Forest", "Atletico Madrid": "Ath Madrid",
+    "Paris Saint-Germain FC": "Paris SG", "PSG": "Paris SG", "Borussia Monchengladbach FC": "M'gladbach",
 }
 
 
@@ -209,12 +212,12 @@ def http_get(url, params=None, headers=None, timeout=25, retries=2):
     return None
 
 
-def cached_bytes(url: str, name: str, max_age_h: float = 12):
+def cached_bytes(url: str, name: str, max_age_h: float = 12, headers=None):
     CACHE_DIR.mkdir(exist_ok=True)
     f = CACHE_DIR / name
     if f.exists() and (time.time() - f.stat().st_mtime) < max_age_h * 3600:
         return f.read_bytes()
-    r = http_get(url)
+    r = http_get(url, headers=headers)
     if r is None:
         return f.read_bytes() if f.exists() else None  # un cache périmé vaut mieux que rien
     f.write_bytes(r.content)
@@ -255,6 +258,27 @@ class SourcesReelles:
         self.use_llm = use_llm
         self.quota = "?"
         self.echecs: list[str] = []
+        self.apifoot = APIFoot(self.echecs)
+        self._fpl = False
+
+    def fpl(self):
+        if self._fpl is False:
+            self._fpl = fpl_joueurs()
+            if self._fpl is None:
+                self.echecs.append("Fantasy Premier League indisponible (blessures Angleterre)")
+        return self._fpl
+
+    def _joueurs_secours(self, comp, now):
+        """Si Understat bloque : Fantasy Premier League (Angleterre) ou meilleurs buteurs API-Football."""
+        if comp["id"] == "soccer_epl" and self.fpl() is not None:
+            j = self.fpl()
+            return j[j["time"] > 0][["joueur", "team", "games", "time", "goals", "xG"]].copy()
+        ligue = LIGUES_APIFOOT.get(comp["id"])
+        if ligue and self.apifoot.ok:
+            df = buteurs_apifoot(self.apifoot, ligue, now)
+            if df is not None:
+                return df[["joueur", "team", "games", "time", "goals", "xG"]]
+        return None
 
     # ---- cotes ----
     def cotes(self, comp):
@@ -466,6 +490,14 @@ class SourcesReelles:
             time.sleep(1)
             return df[["joueur", "team", "games", "time", "goals", "xG"]].dropna()
         except Exception as e:
+            try:
+                secours = self._joueurs_secours(comp, now)
+            except Exception as ex2:
+                log(f"   Source de secours des buteurs indisponible ({ex2})")
+                secours = None
+            if secours is not None:
+                log(f"   Understat indisponible pour {comp['nom']} : buteurs pris sur une source de secours")
+                return secours
             self.echecs.append(f"Buteurs {comp['nom']} (Understat : {e})")
             return None
 
@@ -817,6 +849,263 @@ def option(match, marche, libelle, cote, p_mod, p_mkt, cat, groupe):
 
 
 # =============================================================================
+# EFFECTIFS : API-Football (gratuit, 100 requêtes/jour) + Fantasy Premier League (Angleterre, sans clé)
+# =============================================================================
+API_FOOT_BASE = "https://v3.football.api-sports.io"
+API_FOOT_MAX_JOUR = 95                       # marge sous la limite gratuite de 100 requêtes par jour
+LIGUES_APIFOOT = {"soccer_epl": 39, "soccer_spain_la_liga": 140, "soccer_germany_bundesliga": 78,
+                  "soccer_france_ligue_one": 61, "soccer_uefa_champs_league": 2}
+
+
+def saison_foot(now) -> int:
+    return now.year if now.month >= 7 else now.year - 1
+
+
+class APIFoot:
+    """Client API-Football : chaque réponse est mise en cache, chaque requête comptée (remise à zéro chaque jour)."""
+
+    def __init__(self, echecs: list):
+        self.ok = bool(API_FOOTBALL_KEY)
+        self.echecs = echecs
+        self.erreurs = set()
+        self.f_compteur = CACHE_DIR / "apifoot_compteur.json"
+
+    def _compteur(self, ajout=0) -> int:
+        jour = datetime.now(TZ).strftime("%Y-%m-%d")
+        try:
+            d = json.loads(self.f_compteur.read_text())
+        except Exception:
+            d = {}
+        if d.get("jour") != jour:
+            d = {"jour": jour, "n": 0}
+        if ajout:
+            d["n"] += ajout
+            CACHE_DIR.mkdir(exist_ok=True)
+            self.f_compteur.write_text(json.dumps(d))
+        return d["n"]
+
+    def _erreur(self, msg):
+        if msg not in self.erreurs:
+            self.erreurs.add(msg)
+            self.echecs.append(f"API-Football : {msg}")
+            log(f"   API-Football : {msg}")
+
+    def get(self, chemin, params, ttl_h, garder_vide=True):
+        if not self.ok:
+            return None
+        cle = chemin.strip("/").replace("/", "_") + "_" + "_".join(f"{k}-{v}" for k, v in sorted(params.items()))
+        f = CACHE_DIR / "apifoot" / (re.sub(r"[^A-Za-z0-9_.-]", "", cle) + ".json")
+        if f.exists() and time.time() - f.stat().st_mtime < ttl_h * 3600:
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if self._compteur() >= API_FOOT_MAX_JOUR:
+            self._erreur("quota du jour atteint, données reprises au prochain lancement")
+            return None
+        r = http_get(API_FOOT_BASE + chemin, params=params, headers={"x-apisports-key": API_FOOTBALL_KEY},
+                     timeout=20, retries=1)
+        self._compteur(1)
+        if r is None:
+            self._erreur("pas de réponse (clé invalide ou service indisponible)")
+            return None
+        try:
+            data = r.json()
+        except ValueError:
+            self._erreur("réponse illisible")
+            return None
+        if data.get("errors"):
+            self._erreur(re.sub(r"\s+", " ", str(data["errors"]))[:200])
+            return None
+        rep = data.get("response", [])
+        if rep or garder_vide:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(rep), encoding="utf-8")
+        return rep
+
+    # --- appels utilisés ---
+    def fixtures(self, ligue, jour, now):
+        return self.get("/fixtures", {"league": ligue, "season": saison_foot(now), "date": jour}, ttl_h=12) or []
+
+    def blessures(self, ligue, jour, now):
+        return self.get("/injuries", {"league": ligue, "season": saison_foot(now), "date": jour}, ttl_h=4) or []
+
+    def meilleurs_buteurs(self, ligue, now):
+        return self.get("/players/topscorers", {"league": ligue, "season": saison_foot(now)}, ttl_h=24) or []
+
+    def compos(self, fixture_id):
+        # une compo pas encore publiée n'est pas mise en cache : on redemande au prochain contrôle
+        return self.get("/fixtures/lineups", {"fixture": fixture_id}, ttl_h=6, garder_vide=False) or []
+
+    def trouver_match(self, ligue, home, away, start, now):
+        """Le match API-Football correspondant (même date UTC, ou la veille / le lendemain)."""
+        for decal in (0, -1, 1):
+            jour = (start.astimezone(timezone.utc) + timedelta(days=decal)).strftime("%Y-%m-%d")
+            for fx in self.fixtures(ligue, jour, now):
+                eq = fx.get("teams") or {}
+                h, a = (eq.get("home") or {}).get("name", ""), (eq.get("away") or {}).get("name", "")
+                if match_team(home, [h]) and match_team(away, [a]):
+                    return fx
+        return None
+
+
+def nom_affiche(nom) -> str:
+    return str(nom).split(" / ")[0]
+
+
+def meme_joueur(a, b) -> bool:
+    """« E. Haaland », « Erling Haaland » et « Haaland » désignent le même joueur.
+    Un nom peut porter une variante après « / » (« Rodrigo Hernández / Rodri »)."""
+    if " / " in str(a) or " / " in str(b):
+        return any(_meme_nom(x, y) for x in str(a).split(" / ") for y in str(b).split(" / "))
+    return _meme_nom(a, b)
+
+
+def _meme_nom(a, b) -> bool:
+    na, nb = norm(a).split(), norm(b).split()
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if na[-1] == nb[-1]:
+        if len(na) == 1 or len(nb) == 1:
+            return True
+        return na[0][0] == nb[0][0]
+    longs_a = {t for t in na if len(t) >= 4}
+    longs_b = {t for t in nb if len(t) >= 4}
+    return bool(longs_a & longs_b) and (len(na) == 1 or len(nb) == 1)
+
+
+def dans_liste(nom, noms) -> bool:
+    return any(meme_joueur(nom, n) for n in noms)
+
+
+def fpl_joueurs():
+    """Joueurs de Premier League depuis l'API officielle du Fantasy (statut, chance de jouer, buts, xG, minutes)."""
+    raw = cached_bytes("https://fantasy.premierleague.com/api/bootstrap-static/", "fpl_bootstrap.json",
+                       max_age_h=6, headers=UA_NAV)
+    if raw is None:
+        return None
+    try:
+        d = json.loads(raw)
+        equipes = {t["id"]: t["name"] for t in d["teams"]}
+        rows = [{"joueur": f'{p["first_name"]} {p["second_name"]}', "court": p.get("web_name", ""),
+                 "team": equipes.get(p["team"], ""), "statut": p.get("status", "a"),
+                 "chance": p.get("chance_of_playing_next_round"), "news": p.get("news", ""),
+                 "time": float(p.get("minutes") or 0), "games": float(p.get("starts") or 0),
+                 "goals": float(p.get("goals_scored") or 0), "xG": float(p.get("expected_goals") or 0)}
+                for p in d["elements"]]
+        return pd.DataFrame(rows)
+    except Exception as e:
+        log(f"   Fantasy Premier League illisible : {e}")
+        return None
+
+
+def buteurs_apifoot(api, ligue, now):
+    """Meilleurs buteurs API-Football au format des joueurs Understat (xG estimé : pas de xG dans le plan gratuit)."""
+    rows = []
+    for it in api.meilleurs_buteurs(ligue, now):
+        try:
+            st = it["statistics"][0]
+            mj = float(st["games"].get("appearences") or 0)
+            mins = float(st["games"].get("minutes") or 0)
+            buts = float(st["goals"].get("total") or 0)
+            tirs = float((st.get("shots") or {}).get("total") or 0)
+            if mins <= 0:
+                continue
+            xg = 0.5 * buts + 0.5 * 0.11 * tirs if tirs else 0.85 * buts      # estimation prudente
+            rows.append({"joueur": it["player"]["name"], "team": st["team"]["name"], "games": mj, "time": mins,
+                         "goals": buts, "xG": xg, "titularisations": float(st["games"].get("lineups") or 0)})
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else None
+
+
+def joueurs_cles(team, joueurs_df, n=3):
+    """Les n joueurs les plus décisifs d'une équipe (buts, puis xG)."""
+    if joueurs_df is None or joueurs_df.empty:
+        return []
+    t = match_team(team, joueurs_df["team"].unique().tolist())
+    if not t:
+        return []
+    j = joueurs_df[joueurs_df["team"] == t].sort_values(["goals", "xG"], ascending=False)
+    j = j[(j["time"] >= 180) & ((j["goals"] >= 1) | (j["xG"] >= 1))]     # joue et pèse sur l'attaque
+    if "court" in j.columns:                      # Fantasy : le nom court sert aussi (« Rodri », « Saka »)
+        return [f"{r.joueur} / {r.court}" if r.court and norm(r.court) not in norm(r.joueur).split() else r.joueur
+                for r in j.head(n).itertuples()]
+    return j["joueur"].head(n).tolist()
+
+
+def enrichir_effectifs(matchs_f, src, now):
+    """Blessures et suspensions avant le bilan : alerte si un joueur clé manque, buteurs absents retirés."""
+    api = getattr(src, "apifoot", None)
+    fpl = src.fpl() if hasattr(src, "fpl") else None
+    if (api is None or not api.ok) and fpl is None:
+        return
+    comp_par_nom = {c["nom"]: c for c in COMPETITIONS}
+    for m in matchs_f:
+        comp = comp_par_nom.get(m["comp"], {})
+        ligue = LIGUES_APIFOOT.get(comp.get("id"))
+        absents, douteux = [], []
+        # 1) API-Football : blessures et suspensions du jour du match, pour la ligue
+        if api is not None and api.ok and ligue:
+            fx = api.trouver_match(ligue, m["home"], m["away"], m["start"], now)
+            if fx:
+                m["fixture_id"] = fx["fixture"]["id"]
+                jour = fx["fixture"]["date"][:10]
+                for b in api.blessures(ligue, jour, now):
+                    if (b.get("fixture") or {}).get("id") != m["fixture_id"]:
+                        continue
+                    nom, eq = b["player"]["name"], b["team"]["name"]
+                    cote = "home" if match_team(m["home"], [eq]) else "away"
+                    raison = b["player"].get("reason") or ""
+                    (absents if b["player"].get("type") == "Missing Fixture" else douteux).append(
+                        {"nom": nom, "cote": cote, "raison": raison})
+        # 2) Premier League : statut officiel Fantasy (blessé, suspendu, chance de jouer)
+        if fpl is not None and comp.get("id") == "soccer_epl":
+            for cote in ("home", "away"):
+                t = match_team(m[cote], fpl["team"].unique().tolist())
+                if not t:
+                    continue
+                for r in fpl[fpl["team"] == t].itertuples():
+                    ch = None if pd.isna(r.chance) else int(r.chance)
+                    nom = f"{r.joueur} / {r.court}" if r.court else r.joueur
+                    if r.statut in ("i", "s", "u") or (ch is not None and ch <= 25):
+                        if not dans_liste(nom, [x["nom"] for x in absents]):
+                            absents.append({"nom": nom, "cote": cote, "raison": r.news})
+                    elif r.statut == "d" or (ch is not None and ch <= 75):
+                        if not dans_liste(nom, [x["nom"] for x in douteux]):
+                            douteux.append({"nom": nom, "cote": cote, "raison": r.news})
+        # 3) joueurs clés de chaque équipe
+        sources_cles = []
+        if api is not None and api.ok and ligue:           # d'abord API-Football : mêmes noms que les compos
+            sources_cles.append(buteurs_apifoot(api, ligue, now))
+        if fpl is not None and comp.get("id") == "soccer_epl":
+            sources_cles.append(fpl)
+        cles = {"home": [], "away": []}
+        for cote in ("home", "away"):
+            for df in sources_cles:
+                for nom in joueurs_cles(m[cote], df):
+                    if not dans_liste(nom, cles[cote]):
+                        cles[cote].append(nom)
+            for b in m["buteurs"]:                # les buteurs conseillés sont clés par définition
+                if match_team(b["equipe"], [m[cote]]) and not dans_liste(b["joueur"], cles[cote]):
+                    cles[cote].append(b["joueur"])
+        m["cles"], m["absents"], m["douteux"] = cles, absents, douteux
+        manquent = [f'{nom_affiche(x["nom"])} ({m[x["cote"]]})' for x in absents if dans_liste(x["nom"], cles[x["cote"]])]
+        incertains = [f'{nom_affiche(x["nom"])} ({m[x["cote"]]})' for x in douteux if dans_liste(x["nom"], cles[x["cote"]])]
+        if manquent:
+            m["alerte"] = (m.get("alerte", "") + " · " if m.get("alerte") else "") + "Absent(s) clé(s) : " + ", ".join(manquent)
+        if incertains:
+            m["notes"].append("Incertain(s) : " + ", ".join(incertains))
+        noms_absents = [x["nom"] for x in absents]
+        m["buteurs"] = [b for b in m["buteurs"] if not dans_liste(b["joueur"], noms_absents)]
+        for b in m["buteurs"]:
+            if dans_liste(b["joueur"], [x["nom"] for x in douteux]):
+                b["douteux"] = True
+
+
+# =============================================================================
 # PÉRIMÈTRE : quels matchs analyser
 # =============================================================================
 def classement_actuel(hist, now) -> list[str]:
@@ -1091,6 +1380,30 @@ def selectionner(matchs):
 
 
 COMBI_EDGE_MIN = -0.06      # une sélection de combiné peut être un peu sous le juste prix (marge Betclic), pas plus
+COTE_MAX_COMBI = 10.0       # aucun combiné au-dessus de cette cote totale
+MAX_SELECTIONS = 6          # ni au-delà de ce nombre de sélections
+
+
+def clubs_top():
+    """Les meilleures équipes de la sélection : les clubs fixés dans COMPETITIONS (gros favoris européens)."""
+    return {canon(t) for c in COMPETITIONS for t in c.get("equipes", [])}
+
+
+def est_victoire_top(o, top) -> bool:
+    return (o["marche"] == "1N2" and o["libelle"].startswith("Victoire ")
+            and canon(o["libelle"][len("Victoire "):]) in top)
+
+
+def _plafonne(legs, nom):
+    """Garde les sélections les plus probables tant que la cote totale reste <= COTE_MAX_COMBI."""
+    pris, cote = [], 1.0
+    for o in sorted([l for l in legs if l], key=lambda o: -o["p"]):
+        if len(pris) >= MAX_SELECTIONS:
+            break
+        if cote * o["cote"] <= COTE_MAX_COMBI:
+            pris.append(o)
+            cote *= o["cote"]
+    return _combo(pris, nom) if len(pris) >= 2 else None
 
 
 def _combo(legs, nom=""):
@@ -1103,6 +1416,7 @@ def _combo(legs, nom=""):
 def _chercher(cands, kmin, kmax, cmin, cmax, n=2, critere=lambda c: -c["p"]):
     """Les n meilleurs combinés (une sélection par match), sans sélection en commun entre eux."""
     cands = sorted(cands, key=lambda o: -o["p"])[:14]
+    cmax, kmax = min(cmax, COTE_MAX_COMBI), min(kmax, MAX_SELECTIONS)
     trouves = []
     for k in range(kmin, kmax + 1):
         for legs in itertools.combinations(cands, k):
@@ -1135,16 +1449,30 @@ def construire_combines(matchs):
     matchs = [m for m in matchs if m["cat"] == "FOOT"]          # combinés : foot uniquement
     pool = [o for m in matchs for o in m["options"]
             if o["cote"] >= COTE_MIN and o["statut"] != "SUSPECT" and not o["alerte"] and o["edge"] >= COMBI_EDGE_MIN]
+    top = clubs_top()
+    pool_fav = [o for m in matchs for o in m["options"]          # favoris : on tolère un peu plus de marge
+                if o["cote"] >= COTE_MIN and o["statut"] != "SUSPECT" and not o["alerte"]
+                and o["edge"] >= -0.10 and o["p"] >= 0.55 and est_victoire_top(o, top)]
+    favoris = [{**c, "nom": "Gros favoris"} for c in _chercher(pool_fav, 2, 4, 2.00, 2.50)]
+    if not favoris:                                             # pas assez de favoris pour atteindre 2,00
+        favoris = [{**c, "nom": "Gros favoris (cote sous 2,00 : pas assez de gros matchs cette semaine)"}
+                   for c in _chercher(pool_fav, 2, 4, 1.40, 2.50, n=1, critere=lambda c: -c["cote"])]
     res = {
         "safe": _chercher([o for o in pool if o["p"] >= 0.60], 2, 4, 2.00, 2.50),
+        "favoris": favoris,
         "difficile": _chercher([o for o in pool if o["p"] >= 0.50], 3, 5, 3.60, 4.50,
                                critere=lambda c: (-c["p"], abs(c["cote"] - 4))),
         "global": None, "ldc": [],
     }
     foot = sorted([m for m in matchs if m["cat"] == "FOOT"], key=lambda m: m["start"])
-    legs = [l for l in (_plus_probable(m) for m in foot) if l]
-    if len(legs) >= 2:
-        res["global"] = _combo(legs, f"Tous les matchs de la sélection ({len(legs)})")
+    meilleurs = [l for l in (_plus_probable(m) for m in foot) if l]
+    gros = _chercher(meilleurs, 3, MAX_SELECTIONS, 5.0, COTE_MAX_COMBI, n=1)
+    if gros:
+        res["global"] = {**gros[0], "nom": f"Le plus gros combiné ({len(gros[0]['legs'])} matchs, cote max 10)"}
+    else:
+        c = _plafonne(meilleurs, "")
+        if c:
+            res["global"] = {**c, "nom": f"Le plus gros combiné ({len(c['legs'])} matchs, cote max 10)"}
 
     soirees = {}
     for m in foot:
@@ -1158,19 +1486,19 @@ def construire_combines(matchs):
         sur = _chercher([o for o in nuit if o["p"] >= 0.55], 2, 3, 1.80, 2.60, n=1)
         if sur:
             props.append({**sur[0], "nom": "Le plus sûr de la soirée"})
-        fav = [l for l in (_plus_probable(m, lambda o: o["marche"] == "1N2" and o["libelle"].startswith("Victoire")
-                                          and o["p"] >= 0.55) for m in ms) if l]
-        if len(fav) >= 2:
-            props.append(_combo(fav, "Les favoris de la soirée"))
-        buts = [l for l in (_plus_probable(m, lambda o: o["marche"] == "Buts") for m in ms) if l]
-        if len(buts) >= 2:
-            props.append(_combo(buts, "Les buts de la soirée"))
+        fav = _plafonne([_plus_probable(m, lambda o: o["marche"] == "1N2" and o["libelle"].startswith("Victoire")
+                                        and o["p"] >= 0.55) for m in ms], "Les favoris de la soirée")
+        if fav:
+            props.append(fav)
+        buts = _plafonne([_plus_probable(m, lambda o: o["marche"] == "Buts") for m in ms], "Les buts de la soirée")
+        if buts:
+            props.append(buts)
         obj4 = _chercher(nuit, 2, 4, 3.50, 4.60, n=1, critere=lambda c: (-c["p"], abs(c["cote"] - 4)))
         if obj4:
             props.append({**obj4[0], "nom": "Objectif cote 4"})
-        tous = [l for l in (_plus_probable(m) for m in ms) if l]
-        if len(tous) >= 2:
-            props.append(_combo(tous, f"Tous les matchs de la soirée ({len(tous)})"))
+        maxi = _plafonne([_plus_probable(m) for m in ms], "")
+        if maxi:
+            props.append({**maxi, "nom": f"Le maximum de matchs de la soirée ({len(maxi['legs'])} sur {len(ms)}, cote max 10)"})
         vus, uniques = set(), []
         for c in props:                         # pas deux fois le même ticket
             cle = frozenset((o["match_id"], o["libelle"]) for o in c["legs"])
@@ -1187,10 +1515,12 @@ JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanc
 def groupes_combines(comb):
     """Liste (titre, explication, combinés) commune à l'e-mail, au PDF et à la page."""
     g = [("Paris Safe", "Cote totale entre 2,00 et 2,50 : les sélections les plus probables.", comb["safe"]),
+         ("Paris Safe : gros favoris", "Uniquement des victoires des meilleures équipes de la sélection "
+          "(PSG, top anglais, Bayern, Leverkusen, Dortmund, Real, Barça, Atlético).", comb["favoris"]),
          ("Paris plus difficiles", "Davantage de sélections pour une cote totale autour de 4,00.", comb["difficile"])]
     if comb["global"]:
-        g.append(("Combiné global", "Une sélection par match (la plus probable) sur tous les matchs retenus. "
-                  "Très peu de chances de passer : pour le plaisir.", [comb["global"]]))
+        g.append(("Combiné global", "Les sélections les plus probables de la semaine, en restant sous une cote "
+                  "totale de 10.", [comb["global"]]))
     for s in comb["ldc"]:
         g.append((f"Spécial Ligue des Champions : {JOURS_FR[s['jour'].weekday()]} {s['jour']:%d/%m}",
                   f"{s['n']} matchs ce soir-là : plusieurs combinés possibles.", s["combos"]))
@@ -1270,7 +1600,7 @@ def badge_edge(o):
 
 
 def badge_niv(b):
-    return {"SOLIDE": pill("SOLIDE", C["rouge"], C["rouge_f"]), "MOYEN": pill("MOYEN", C["ambre"], C["ambre_f"]),
+    return {"SOLIDE": pill("FORT", C["rouge"], C["rouge_f"]), "MOYEN": pill("MOYEN", C["ambre"], C["ambre_f"]),
             "FAIBLE": pill("FAIBLE", C["vert"], C["vert_f"])}.get(b, "")
 
 
@@ -1715,24 +2045,20 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
     buteurs = syn["buteurs"][:3]
     bloc_but = "".join(
         f'<div style="border:1px solid {bord};border-radius:12px;padding:14px 16px;margin:10px 0;background:#fff">'
-        f'<div style="font-size:18px;font-weight:800">{e(b["joueur"])}</div>'
+        f'<div style="font-size:18px;font-weight:800">{e(b["joueur"])}'
+        + (' <span style="font-size:13px;color:#9a5b00">(incertain)</span>' if b.get("douteux") else "") + '</div>'
         f'<div style="font-size:14px;color:{gris}">{e(b["equipe"])} contre {e(b["adv"])} · {heure(b["start"])}</div>'
         f'<div style="font-size:16px;margin-top:8px">Chance de marquer : <b>{pc(b["p"])}</b></div>'
         f'<div style="font-size:15px;margin-top:4px">Joue-le seulement si Betclic le cote <b>au moins {fr(b["cote_min"] * 1.1)}</b></div></div>'
         for b in buteurs)
 
     if page:
-        bouton = ('<a href="{}" style="display:block;text-align:center;background:#1a56db;color:#fff;'
-                  'text-decoration:none;font-weight:700;font-size:17px;padding:14px;border-radius:10px;margin:8px 0">{}</a>')
-        pdf_txt = ((bouton.format("bilan.pdf", "Ouvrir le PDF détaillé") if avec_pdf else "")
-                   + bouton.format("detail.html", "Voir toutes les stats des matchs")
-                   + f'<div style="font-size:13px;color:{gris};text-align:center;margin-top:6px">'
-                     f'Mis à jour le {datetime.now(TZ):%d/%m/%Y à %H:%M}</div>')
-    else:
-        pdf_txt = ("Tout le détail (stats de chaque équipe, tous les matchs, autres buteurs) est dans le "
-                   "<b>PDF joint</b> à ce mail." if avec_pdf else "")
+        return page_onglets(locals())
+    pdf_txt = ("Tout le détail (stats de chaque équipe, tous les matchs, autres buteurs) est dans le "
+               "<b>PDF joint</b> à ce mail." if avec_pdf else "")
     corps = (
-        f'<div style="font-size:28px;font-weight:800;line-height:1.2">Tes paris de la semaine</div>'
+        ("<!--COMPOS-->" if page else "")
+        + f'<div style="font-size:28px;font-weight:800;line-height:1.2">Tes paris de la semaine</div>'
         f'<div style="font-size:15px;color:{gris};margin-top:4px">Matchs du {now.astimezone(TZ):%d/%m} au {fin.astimezone(TZ):%d/%m}</div>'
         f'<div style="font-size:17px;line-height:1.5;margin-top:16px">{intro}</div>'
         + (titre_sec("Les paris à jouer", "Un pari = une mise séparée.") + bloc_paris if bloc_paris else "")
@@ -1752,6 +2078,473 @@ def generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf: bool, page: 
                '<link rel="manifest" href="manifest.json">' if page else "") + '</head>'
             f'<body style="margin:0;background:#f5f7fa;{police}color:{txt}">'
             f'<div style="max-width:600px;margin:0 auto;padding:20px 14px">{corps}</div></body></html>')
+
+
+# =============================================================================
+# L'APPLI « MES PARIS » (page de l'icône) : onglets, camemberts, ticket récapitulatif
+# =============================================================================
+MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
+           "novembre", "décembre"]
+JOURS_COURTS = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
+
+APPLI_CSS = """
+:root{--rouge:#C1121F;--rouge-pale:#FDECEC;--encre:#18181B;--ardoise:#52525B;--gris:#A1A1AA;--clair:#D4D4D8;
+--trait:#E4E4E7;--fond:#F7F7F8;--blanc:#FFFFFF;
+--cond:'Barlow Semi Condensed','Arial Narrow',system-ui,sans-serif;--texte:'Barlow',system-ui,-apple-system,'Segoe UI',sans-serif}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--fond);color:var(--encre);font-family:var(--texte);font-size:16px;line-height:1.45}
+.page{max-width:600px;margin:0 auto;padding:0 16px}
+.tete{padding-top:22px;padding-bottom:14px}
+.maj{color:var(--gris);font-size:13px;margin-top:2px}
+.marque{display:flex;align-items:center;gap:10px}
+.marque i{width:14px;height:14px;background:var(--rouge);border-radius:3px}
+.marque h1{font:700 32px/1 var(--cond);letter-spacing:-.01em;margin:0}
+.semaine{color:var(--ardoise);font-size:15px;margin-top:6px}
+.onglets{position:sticky;top:0;z-index:10;background:var(--blanc);border-bottom:1px solid var(--trait)}
+.rail{max-width:600px;margin:0 auto;display:flex;overflow-x:auto;scrollbar-width:none;padding:0 6px}
+.rail::-webkit-scrollbar{display:none}
+.onglet{flex:0 0 auto;background:none;border:0;border-bottom:3px solid transparent;padding:15px 10px 12px;
+font:600 17px/1 var(--cond);color:var(--ardoise);cursor:pointer;white-space:nowrap}
+.onglet[aria-selected=true]{color:var(--encre);border-bottom-color:var(--rouge)}
+.onglet span{color:var(--gris);font-weight:500;margin-left:5px}
+[data-panneau]{padding:6px 0 130px}
+h2{font:700 23px/1.15 var(--cond);margin:24px 0 4px}
+.aide{color:var(--ardoise);font-size:14px;margin:0 0 12px}
+.intro{font-size:17px;margin:14px 0 4px}
+.liste{background:var(--blanc);border:1px solid var(--trait);border-radius:12px;overflow:hidden}
+.ligne{display:flex;align-items:center;gap:12px;padding:14px;border-top:1px solid var(--trait)}
+.ligne:first-child{border-top:0}
+.corps{flex:1;min-width:0}
+.carte{display:grid;grid-template-columns:1fr auto;column-gap:12px;row-gap:2px;padding:14px;border-top:1px solid var(--trait)}
+.carte:first-child{border-top:0}
+.carte .droite{text-align:right}
+.carte .bas{grid-column:1 / -1;display:flex;align-items:center;gap:10px;margin-top:8px}
+.carte .bas .txt{flex:1;min-width:0;font-size:14px;color:var(--ardoise)}
+.carte .bas .txt b{color:var(--encre);font-weight:600}
+.carte .bas .txt .r{color:var(--rouge);font-weight:600}
+.sel{font-weight:600;font-size:17px;line-height:1.25}
+.qui{color:var(--ardoise);font-size:14px;margin-top:2px}
+.prix{text-align:right;flex:0 0 auto}
+.cote{font:700 27px/1 var(--cond)}
+.mini{color:var(--ardoise);font-size:12px;white-space:nowrap;margin-top:3px}
+.plus{font-size:14px;color:var(--rouge);font-weight:600;margin-top:4px}
+.note{font-size:13px;color:var(--ardoise);margin-top:3px}
+.alerte{font-size:13px;color:var(--rouge);margin-top:4px}
+.pick{flex:0 0 auto;width:42px;height:42px;border-radius:50%;border:2px solid var(--clair);background:var(--blanc);
+display:grid;place-items:center;cursor:pointer;color:var(--clair);padding:0}
+.pick svg{width:18px;height:18px}
+.pick[aria-pressed=true]{background:var(--rouge);border-color:var(--rouge);color:#fff}
+button:focus-visible,a:focus-visible{outline:3px solid var(--rouge);outline-offset:2px}
+.donut text{font:700 15px var(--cond);fill:var(--encre)}
+.ticket{background:var(--blanc);border:1px solid var(--trait);border-radius:12px;margin:12px 0;overflow:hidden}
+.ticket .haut{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px dashed var(--clair)}
+.ticket .nom{font:700 18px/1.2 var(--cond)}
+.jambe{display:flex;justify-content:space-between;gap:10px;padding:9px 14px;border-top:1px solid var(--trait)}
+.jambe:first-of-type{border-top:0}
+.jambe .c{font:700 19px/1.2 var(--cond)}
+.ticket .bas{display:flex;align-items:center;gap:14px;padding:12px 14px;background:var(--fond);border-top:1px dashed var(--clair)}
+.ticket .total{font:700 30px/1 var(--cond)}
+.ticket .bas .quoi{flex:1;font-size:13px;color:var(--ardoise)}
+.renta{font-size:13px;color:var(--ardoise)}
+.renta.ok{color:var(--encre);font-weight:600}
+.fiche{background:var(--blanc);border:1px solid var(--trait);border-radius:12px;padding:14px;margin:12px 0}
+.fiche .titre{font:700 20px/1.2 var(--cond)}
+.equipes{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+.equipe .n{font-weight:600}
+.niveau{font-size:13px;color:var(--ardoise)}
+.niveau.fort{color:var(--rouge);font-weight:600}
+.camembert{display:flex;align-items:center;gap:8px;margin:8px 0}
+.legende{font-size:12px;color:var(--ardoise);line-height:1.5}
+.forme b{display:inline-block;width:17px;height:17px;border-radius:4px;margin-right:2px;font:700 11px/17px var(--texte);text-align:center;color:#fff}
+.forme .V{background:var(--rouge)}.forme .N{background:var(--gris)}.forme .D{background:var(--clair);color:var(--encre)}
+.stat{font-size:13px;color:var(--ardoise);margin-top:3px}
+.stat b{color:var(--encre);font-weight:600}
+.puces{margin-top:12px}
+.puce{border:1px solid var(--trait);background:var(--blanc);border-radius:999px;padding:7px 12px;font:500 14px var(--texte);
+color:var(--encre);margin:6px 6px 0 0;cursor:pointer}
+.puce b{font:700 16px var(--cond);margin-left:4px}
+.puce.bon{border-color:var(--rouge)}
+.puce[aria-pressed=true]{background:var(--rouge);border-color:var(--rouge);color:#fff}
+.barres{margin-top:8px}
+.barre{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ardoise);margin-top:4px}
+.barre .l{width:44px}
+.barre .p{flex:1;height:6px;background:var(--trait);border-radius:3px;overflow:hidden}
+.barre .p i{display:block;height:100%;background:var(--gris)}
+.barre.choix .p i{background:var(--rouge)}
+.barre .v{width:38px;text-align:right;color:var(--encre)}
+.vide{color:var(--ardoise);font-size:16px;margin:28px 0}
+.liens{margin:28px 0 0;display:flex;gap:18px;flex-wrap:wrap}
+.liens a{color:var(--rouge);font-weight:600;text-decoration:none}
+.pied{color:var(--ardoise);font-size:13px;margin:26px 0 0}
+.barre-ticket{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--rouge);color:#fff;
+padding:12px 16px calc(12px + env(safe-area-inset-bottom));transform:translateY(110%);transition:transform .25s ease}
+.barre-ticket.visible{transform:none}
+.barre-ticket .in{max-width:600px;margin:0 auto;display:flex;align-items:center;gap:14px}
+.barre-ticket .n{font-size:15px;flex:1}
+.barre-ticket .t{font:700 30px/1 var(--cond)}
+.barre-ticket button{background:#fff;color:var(--rouge);border:0;border-radius:999px;padding:11px 16px;font:700 16px var(--cond);cursor:pointer}
+.voile{position:fixed;inset:0;background:rgba(24,24,27,.45);z-index:30;opacity:0;pointer-events:none;transition:opacity .2s}
+.voile.ouvert{opacity:1;pointer-events:auto}
+.feuille{position:fixed;left:0;right:0;bottom:0;z-index:31;background:var(--blanc);border-radius:18px 18px 0 0;
+max-height:86vh;overflow:auto;transform:translateY(105%);transition:transform .25s ease;
+padding:8px 16px calc(18px + env(safe-area-inset-bottom))}
+.feuille.ouvert{transform:none}
+.feuille .in{max-width:600px;margin:0 auto}
+.poignee{width:44px;height:5px;border-radius:3px;background:var(--clair);margin:6px auto 10px}
+.feuille h2{margin-top:6px}
+.retire{background:none;border:0;color:var(--ardoise);font-size:22px;line-height:1;padding:6px 8px;cursor:pointer}
+.recap{margin:14px 0;padding:14px;border:1px dashed var(--clair);border-radius:12px}
+.recap .t{font:700 34px/1 var(--cond);color:var(--rouge)}
+.avert{color:var(--rouge);font-size:14px;margin-top:8px}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.btn{border-radius:999px;padding:12px 18px;font:700 17px var(--cond);cursor:pointer;text-decoration:none;display:inline-block}
+.btn.plein{background:var(--rouge);color:#fff;border:0}
+.btn.creux{background:var(--blanc);color:var(--rouge);border:2px solid var(--rouge)}
+.btn.texte{background:none;border:0;color:var(--ardoise)}
+.info{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:var(--encre);color:#fff;
+padding:10px 16px;border-radius:999px;font-size:15px;z-index:40;opacity:0;transition:opacity .2s;pointer-events:none}
+.info.visible{opacity:1}
+@media (prefers-reduced-motion:reduce){.barre-ticket,.feuille,.voile,.info{transition:none}}
+"""
+
+APPLI_JS = r"""
+(function(){
+var ID=document.body.getAttribute('data-semaine'),CLE='mesparis-ticket-'+ID,memoire=[];
+function lire(){try{var s=localStorage.getItem(CLE);return s?JSON.parse(s):memoire.slice();}catch(e){return memoire.slice();}}
+function ecrire(t){memoire=t.slice();try{localStorage.setItem(CLE,JSON.stringify(t));}catch(e){}}
+function fr(x){return (Math.round(x*100)/100).toFixed(2).replace('.',',');}
+function pc(x){return x>0&&x<0.01?'moins de 1 %':Math.round(x*100)+' %';}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+/* onglets */
+var tabs=document.querySelectorAll('[data-onglet]'),pans=document.querySelectorAll('[data-panneau]');
+function montre(id){pans.forEach(function(x){x.hidden=x.getAttribute('data-panneau')!==id;});
+tabs.forEach(function(x){var on=x.getAttribute('data-onglet')===id;x.setAttribute('aria-selected',on?'true':'false');
+x.tabIndex=on?0:-1;if(on&&x.scrollIntoView){x.scrollIntoView({block:'nearest',inline:'center'});}});
+try{history.replaceState(null,'','#'+id);}catch(e){}}
+tabs.forEach(function(x,i){x.addEventListener('click',function(){montre(x.getAttribute('data-onglet'));window.scrollTo(0,0);});
+x.addEventListener('keydown',function(ev){var d=ev.key==='ArrowRight'?1:ev.key==='ArrowLeft'?-1:0;if(!d)return;
+var n=tabs[(i+d+tabs.length)%tabs.length];n.focus();n.click();});});
+function depuisAdresse(){var h=(location.hash||'').slice(1);montre(document.querySelector('[data-panneau="'+h+'"]')?h:'jouer');}
+window.addEventListener('hashchange',depuisAdresse);depuisAdresse();
+/* ticket */
+var barre=document.getElementById('barre-ticket'),feuille=document.getElementById('feuille'),voile=document.getElementById('voile'),
+contenu=document.getElementById('contenu-ticket'),info=document.getElementById('info');
+function message(t){info.textContent=t;info.classList.add('visible');setTimeout(function(){info.classList.remove('visible');},1800);}
+function total(t){var simples=t.filter(function(x){return x.cote&&!x.legs;});if(simples.length<2||simples.length!==t.length)return null;
+var mids={},double=false;simples.forEach(function(x){(x.mids||[x.mid]).forEach(function(m){if(mids[m])double=true;mids[m]=1;});});
+var c=1,p=1;simples.forEach(function(x){c*=x.cote;p*=x.p||0;});return {cote:c,p:p,double:double};}
+function rafraichir(){var t=lire(),ids={};t.forEach(function(x){ids[x.id]=1;});
+document.querySelectorAll('[data-item]').forEach(function(b){var it=JSON.parse(b.getAttribute('data-item'));
+var on=!!ids[it.id];b.setAttribute('aria-pressed',on?'true':'false');
+if(b.classList.contains('pick'))b.setAttribute('aria-label',(on?'Retirer du ticket : ':'Ajouter au ticket : ')+it.sel);});
+var tot=total(t);barre.classList.toggle('visible',t.length>0);barre.setAttribute('aria-hidden',t.length?'false':'true');
+document.getElementById('nb-ticket').textContent=t.length+(t.length>1?' sélections':' sélection');
+document.getElementById('cote-ticket').textContent=tot?fr(tot.cote):'';
+if(!t.length){contenu.innerHTML='<p class="vide">Ton ticket est vide. Coche des paris dans les onglets pour les retrouver ici.</p>';return;}
+var h='<div class="liste">';t.forEach(function(x){h+='<div class="ligne"><div class="corps"><div class="sel">'+esc(x.sel)+'</div><div class="qui">'+esc(x.match)+(x.quand?', '+esc(x.quand):'')+'</div>';
+if(x.legs){x.legs.forEach(function(l){h+='<div class="note">'+esc(l.sel)+', '+esc(l.match)+' : '+fr(l.cote)+'</div>';});}
+h+='</div><div class="prix"><div class="cote">'+(x.cote?fr(x.cote):'')+'</div>'+(x.cote?'':'<div class="mini">mini '+fr(x.mini)+'</div>')+'</div>'+
+'<button class="retire" type="button" data-retire="'+esc(x.id)+'" aria-label="Retirer '+esc(x.sel)+'">×</button></div>';});
+h+='</div>';
+if(tot){h+='<div class="recap"><div class="note">Si tu les joues ensemble en un combiné</div><div class="t">'+fr(tot.cote)+'</div><div class="note">chance de passer estimée : '+pc(tot.p)+'</div>'+
+(tot.double?'<div class="avert">Deux sélections portent sur le même match : Betclic peut refuser de les combiner.</div>':'')+'</div>';}
+else if(t.length>1){h+='<div class="recap"><div class="note">Ce ticket mélange combinés et paris sans cote : joue-les en mises séparées.</div></div>';}
+contenu.innerHTML=h;
+contenu.querySelectorAll('[data-retire]').forEach(function(b){b.addEventListener('click',function(){
+ecrire(lire().filter(function(x){return x.id!==b.getAttribute('data-retire');}));rafraichir();});});}
+document.querySelectorAll('[data-item]').forEach(function(b){b.addEventListener('click',function(){
+var it=JSON.parse(b.getAttribute('data-item')),t=lire(),i=t.findIndex(function(x){return x.id===it.id;});
+if(i>=0){t.splice(i,1);}else{t.push(it);}ecrire(t);rafraichir();});});
+function ouvrir(o){feuille.classList.toggle('ouvert',o);voile.classList.toggle('ouvert',o);feuille.setAttribute('aria-hidden',o?'false':'true');
+if(o){feuille.focus();}}
+document.getElementById('voir-ticket').addEventListener('click',function(){ouvrir(true);});
+document.getElementById('fermer-ticket').addEventListener('click',function(){ouvrir(false);});
+voile.addEventListener('click',function(){ouvrir(false);});
+document.addEventListener('keydown',function(ev){if(ev.key==='Escape')ouvrir(false);});
+document.getElementById('vider-ticket').addEventListener('click',function(){ecrire([]);rafraichir();message('Ticket vidé');});
+document.getElementById('copier-ticket').addEventListener('click',function(){var t=lire(),tot=total(t);
+var l=['Mes paris, ticket du '+document.body.getAttribute('data-jour')];
+t.forEach(function(x){l.push('- '+x.sel+' ('+x.match+(x.quand?', '+x.quand:'')+') : '+(x.cote?fr(x.cote):'cote mini '+fr(x.mini)));
+(x.legs||[]).forEach(function(g){l.push('    '+g.sel+' ('+g.match+') : '+fr(g.cote));});});
+if(tot)l.push('Combiné de toutes les sélections : cote '+fr(tot.cote));var txt=l.join('\n');
+function secours(){var a=document.createElement('textarea');a.value=txt;document.body.appendChild(a);a.select();
+try{document.execCommand('copy');message('Liste copiée');}catch(e){message('Copie impossible');}a.remove();}
+if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt).then(function(){message('Liste copiée');},secours);}else{secours();}});
+rafraichir();
+})();
+"""
+
+COCHE_SVG = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.2 4.2L19 7" fill="none" '
+             'stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def quand_court(dt) -> str:
+    d = dt.astimezone(TZ)
+    return f"{JOURS_COURTS[d.weekday()]} {d:%d/%m} à {d:%H:%M}"
+
+
+def donut(p, taille=54, ep=7, texte=None, label=""):
+    """Camembert en anneau : la part rouge = la probabilité."""
+    r = (taille - ep) / 2
+    circ = 2 * math.pi * r
+    arc = max(0.0, min(1.0, p)) * circ
+    c = taille / 2
+    t = texte if texte is not None else pc(p).replace(" %", "%").replace("moins de 1%", "<1%")
+    return (f'<svg class="donut" width="{taille}" height="{taille}" viewBox="0 0 {taille} {taille}" role="img" '
+            f'aria-label="{e(label or pc(p))}"><circle cx="{c}" cy="{c}" r="{r:.2f}" fill="none" stroke="#E4E4E7" '
+            f'stroke-width="{ep}"/><circle cx="{c}" cy="{c}" r="{r:.2f}" fill="none" stroke="#C1121F" '
+            f'stroke-width="{ep}" stroke-dasharray="{arc:.2f} {circ:.2f}" transform="rotate(-90 {c} {c})"/>'
+            f'<text x="{c}" y="{c + taille * 0.09:.1f}" text-anchor="middle" style="font-size:{taille * 0.24:.1f}px">{e(t)}</text></svg>')
+
+
+def donut_parts(parts, taille=58, ep=9, label=""):
+    """Camembert en anneau à plusieurs parts : [(valeur, couleur), ...]."""
+    tot = sum(v for v, _ in parts) or 1
+    r = (taille - ep) / 2
+    circ = 2 * math.pi * r
+    c, deb, arcs = taille / 2, 0.0, ""
+    for v, coul in parts:
+        lg = v / tot * circ
+        if lg > 0:
+            arcs += (f'<circle cx="{c}" cy="{c}" r="{r:.2f}" fill="none" stroke="{coul}" stroke-width="{ep}" '
+                     f'stroke-dasharray="{lg:.2f} {circ:.2f}" stroke-dashoffset="{-deb:.2f}" transform="rotate(-90 {c} {c})"/>')
+        deb += lg
+    return (f'<svg class="donut" width="{taille}" height="{taille}" viewBox="0 0 {taille} {taille}" role="img" '
+            f'aria-label="{e(label)}"><circle cx="{c}" cy="{c}" r="{r:.2f}" fill="none" stroke="#F7F7F8" '
+            f'stroke-width="{ep}"/>{arcs}</svg>')
+
+
+def item_attr(item) -> str:
+    return e(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+
+
+def item_option(o) -> dict:
+    return {"id": f'{o["match_id"]}|{o["libelle"]}', "sel": o["libelle"], "match": o["match"],
+            "quand": quand_court(o["start"]), "cote": o["cote"], "p": round(o["p"], 4), "mid": str(o["match_id"])}
+
+
+def bouton_pick(item) -> str:
+    return (f'<button class="pick" type="button" aria-pressed="false" aria-label="Ajouter au ticket : {e(item["sel"])}" '
+            f'data-item="{item_attr(item)}">{COCHE_SVG}</button>')
+
+
+def ligne_pari(o, avec_donut=True) -> str:
+    v, _, _ = verdict(o["p"])
+    if o["statut"] == "VALUE":
+        mise = f', mise {fr(o["mise"], 1)} % du capital' if o["mise"] > 0 else ""
+        euros = f' ({fr(BANKROLL * o["mise"] / 100)} €)' if BANKROLL and mise else ""
+        detail = f'<b>{pc(o["p"])}</b> de chance, <span class="r">+{round(100 * o["edge"])} % d\'avantage</span>{mise}{euros}'
+    else:
+        detail = f'<b>{pc(o["p"])}</b> de chance, {v.lower()}, cote un peu basse'
+    al = f'<div class="alerte">{e(o["alerte"])}</div>' if o["alerte"] else ""
+    return (f'<div class="carte"><div class="sel">{e(o["libelle"])}</div><div class="droite cote">{fr(o["cote"])}</div>'
+            f'<div class="qui">{e(o["match"])}, {quand_court(o["start"])}</div>'
+            f'<div class="droite mini">mini {fr(o["cote_min"])}</div>'
+            f'<div class="bas">' + (donut(o["p"], taille=44, ep=6, label=f'Chance de gagner {pc(o["p"])}') if avec_donut else "")
+            + f'<div class="txt">{detail}{al}</div>{bouton_pick(item_option(o))}</div></div>')
+
+
+def ticket_combine(c, nom) -> str:
+    item = {"id": "combi|" + "|".join(sorted(f'{o["match_id"]}:{o["libelle"]}' for o in c["legs"])),
+            "sel": f"Combiné : {nom}", "match": f'{len(c["legs"])} matchs', "quand": "",
+            "cote": round(c["cote"], 4), "p": round(c["p"], 5), "mids": sorted({str(o["match_id"]) for o in c["legs"]}),
+            "legs": [{"sel": o["libelle"], "match": o["match"], "cote": o["cote"]} for o in c["legs"]]}
+    jambes = "".join(f'<div class="jambe"><div><div class="sel" style="font-size:16px">{e(o["libelle"])}</div>'
+                     f'<div class="qui">{e(o["match"])}, {quand_court(o["start"])}</div></div>'
+                     f'<div class="c">{fr(o["cote"])}</div></div>' for o in c["legs"])
+    renta = (f'<span class="renta ok">rentable, +{round(100 * c["ev"])} %</span>' if c["ev"] > 0
+             else f'<span class="renta">pour le plaisir ({round(100 * c["ev"])} %)</span>')
+    return (f'<div class="ticket"><div class="haut"><div class="nom">{e(nom)}</div>{bouton_pick(item)}</div>{jambes}'
+            f'<div class="bas">{donut(c["p"], taille=50, ep=6, label=f"Chance de passer {pc(c["p"])}")}'
+            f'<div class="quoi">chance de passer<br>{renta}</div>'
+            f'<div style="text-align:right"><div class="total">{fr(c["cote"])}</div><div class="note">cote totale</div></div></div></div>')
+
+
+def fiche_match(m) -> str:
+    foot = m["cat"] == "FOOT"
+
+    def equipe(nom, s):
+        if not s:
+            return f'<div class="equipe"><div class="n">{e(nom)}</div><div class="stat">Statistiques indisponibles</div></div>'
+        niv = niveau_mot(s["badge"])
+        if foot:
+            v, n, d = (int(x) for x in s["VND"].split("-"))
+            cam = donut_parts([(v, "#C1121F"), (n, "#A1A1AA"), (d, "#D4D4D8")],
+                              label=f"{v} victoires, {n} nuls, {d} défaites")
+            leg = f'<div class="legende"><b style="color:#C1121F">{v} V</b>, {n} N, {d} D<br>sur {s["MJ"]} matchs</div>'
+            stats = (f'<div class="stat">Buts marqués <b>{fr(s["BM"], 1)}</b>, encaissés <b>{fr(s["BE"], 1)}</b> par match</div>'
+                     f'<div class="stat">Plus de 2,5 buts <b>{pc(s["O25"])}</b>, les 2 marquent <b>{pc(s["BTTS"])}</b></div>'
+                     f'<div class="stat">Victoires à domicile <b>{pc(s["pV_dom"])}</b>, à l\'extérieur <b>{pc(s["pV_ext"])}</b></div>')
+        else:
+            v, d = (int(x) for x in s["VD"].split("-"))
+            cam = donut_parts([(v, "#C1121F"), (d, "#D4D4D8")], label=f"{v} victoires, {d} défaites")
+            leg = f'<div class="legende"><b style="color:#C1121F">{v} V</b>, {d} D<br>sur {s["MJ"]} matchs</div>'
+            b2b = '<div class="alerte">2e match en 2 jours</div>' if s.get("repos") == 1 else ""
+            stats = (f'<div class="stat">Points marqués <b>{fr(s["PM"], 1)}</b>, encaissés <b>{fr(s["PE"], 1)}</b></div>'
+                     f'<div class="stat">Écart moyen <b>{fr(s["net"], 1)}</b></div>{b2b}')
+        forme = "".join(f'<b class="{x}">{x}</b>' for x in s["forme"])
+        return (f'<div class="equipe"><div class="n">{e(nom)}</div>'
+                f'<div class="niveau{" fort" if niv == "FORT" else ""}">Niveau {niv.lower()}, {rang_txt(s["rang"])}</div>'
+                f'<div class="camembert">{cam}{leg}</div><div class="forme" aria-label="5 derniers matchs">{forme}</div>{stats}</div>')
+    opts = [o for o in m["options"] if o["groupe"] == "1N2"] + sorted(
+        [o for o in m["options"] if o["groupe"] != "1N2"], key=lambda o: -o["edge"])[:2]
+    puces = "".join(
+        f'<button class="puce{" bon" if o["statut"] == "VALUE" else ""}" type="button" aria-pressed="false" '
+        f'data-item="{item_attr(item_option(o))}">{e(o["libelle"].replace("Victoire ", ""))}<b>{fr(o["cote"])}</b></button>'
+        for o in opts)
+    notes = "".join(f'<div class="note">{e(n)}</div>' for n in m["notes"])
+    if m.get("alerte"):
+        notes += f'<div class="alerte">{e(m["alerte"])}</div>'
+    attendus = f', buts attendus {fr(m["lam"])} à {fr(m["mu"])}' if m.get("lam") is not None else ""
+    return (f'<article class="fiche"><div class="titre">{e(m["home"])} contre {e(m["away"])}</div>'
+            f'<div class="qui">{e(m["comp"])}, {quand_court(m["start"])}{attendus}</div>'
+            f'<div class="equipes">{equipe(m["home"], m.get("stats_h"))}{equipe(m["away"], m.get("stats_a"))}</div>'
+            f'<div class="puces" aria-label="Cotes Betclic, à cocher">{puces}</div>{notes}</article>')
+
+
+def page_onglets(v) -> str:
+    """Page de l'icône « Mes paris » : onglets par type de pari, camemberts, ticket récapitulatif à cocher."""
+    syn, now, fin = v["syn"], v["now"], v["fin"]
+    matchs_f, matchs_b = v["matchs_f"], v["matchs_b"]
+    a_jouer = syn["a_jouer"]
+
+    def vide(t):
+        return f'<p class="vide">{t}</p>'
+
+    def titre(t, aide=""):
+        return f"<h2>{t}</h2>" + (f'<p class="aide">{aide}</p>' if aide else "")
+
+    # --- À jouer
+    n_matchs = len(matchs_f) + len(matchs_b)
+    if a_jouer:
+        jouer = (f'<p class="intro">{len(a_jouer)} pari{"s" if len(a_jouer) > 1 else ""} sur {n_matchs} matchs ont une '
+                 f'cote Betclic plus haute que leur vraie chance de passer. Coche ceux que tu veux jouer.</p>'
+                 + '<div class="liste">' + "".join(ligne_pari(o) for o in a_jouer) + "</div>")
+    else:
+        jouer = vide(f"Aucune cote Betclic n'est assez haute cette semaine sur {n_matchs} matchs : le mieux est de ne rien jouer.")
+    if syn["probables"]:
+        jouer += (titre("Les plus sûrs", "Forte chance de passer, mais la cote est souvent trop basse pour être rentable.")
+                  + '<div class="liste">' + "".join(ligne_pari(o, avec_donut=False) for o in syn["probables"]) + "</div>")
+    jouer += ('<div class="liens">' + ('<a href="bilan.pdf">Ouvrir le PDF détaillé</a>' if v["avec_pdf"] else "")
+              + '<a href="detail.html">Rapport complet</a></div>')
+
+    # --- Buts
+    lignes_buts = []
+    for x in syn["buts"]:
+        m, ch = x["match"], x["choix"]
+        barres = "".join(
+            f'<div class="barre{" choix" if l is ch else ""}"><span class="l">{l["libelle"].replace(" buts", "").replace("Plus de ", "+").replace("Moins de ", "−")}</span>'
+            f'<span class="p"><i style="width:{round(100 * l["p"])}%"></i></span><span class="v">{pc(l["p"])}</span></div>'
+            for l in x["lignes"] if l["sens"] == "Plus" or l is ch)
+        item = (item_option(ch["opt"]) if ch["opt"] else
+                {"id": f'{m["id"]}|{ch["libelle"]}', "sel": ch["libelle"], "match": f'{m["home"]} – {m["away"]}',
+                 "quand": quand_court(m["start"]), "cote": None, "mini": round(ch["cote_min"] * 1.05, 2),
+                 "p": round(ch["p"], 4), "mid": str(m["id"])})
+        prix = (f'<div class="droite cote">{fr(ch["cote"])}</div><div class="droite mini">cote Betclic</div>' if ch["cote"]
+                else f'<div class="droite cote" style="color:#A1A1AA">–</div><div class="droite mini">mini {fr(ch["cote_min"] * 1.05)}</div>')
+        lignes_buts.append(
+            f'<div class="carte"><div class="qui" style="margin:0;grid-column:1 / -1">{e(m["home"])} – {e(m["away"])}, '
+            f'{quand_court(m["start"])}</div>'
+            f'<div class="sel" style="margin-top:4px">{e(ch["libelle"])}</div>{prix.split("</div>", 1)[0]}</div>'
+            f'<div class="note">{e(x["raison"].capitalize())}</div>{prix.split("</div>", 1)[1]}'
+            f'<div class="bas"><div class="barres txt" style="margin:0">{barres}</div>{bouton_pick(item)}</div></div>')
+    buts = (titre("Nombre de buts", "Notre conseil pour chaque match, et la chance de chaque ligne.")
+            + '<div class="liste">' + "".join(lignes_buts) + "</div>") if lignes_buts else vide("Aucun match de foot retenu.")
+
+    # --- Combinés
+    groupes = groupes_combines(syn["comb"])
+    std = [g for g in groupes if not g[0].startswith("Spécial")]
+    ldc_g = [g for g in groupes if g[0].startswith("Spécial")]
+
+    def bloc_combines(gs):
+        h = ""
+        for t, expl, combos in gs:
+            if combos:
+                h += titre(e(t), e(expl)) + "".join(ticket_combine(c, c.get("nom") or f"{t} n°{i}")
+                                                     for i, c in enumerate(combos, 1))
+        return h
+    n_comb = sum(len(c) for _, _, c in std)
+    combines = bloc_combines(std) if n_comb else vide("Aucune combinaison possible cette semaine.")
+
+    # --- Buteurs
+    buteurs = syn["buteurs"][:12]
+    lignes_but = []
+    for b in buteurs:
+        mid = next((str(m["id"]) for m in matchs_f if f'{m["home"]} – {m["away"]}' == b["match"]), b["match"])
+        item = {"id": f'{mid}|buteur|{b["joueur"]}', "sel": f'{b["joueur"]} buteur', "match": b["match"],
+                "quand": quand_court(b["start"]), "cote": None, "mini": round(b["cote_min"] * 1.1, 2),
+                "p": round(b["p"], 4), "mid": mid}
+        inc = '<div class="alerte">Incertain pour ce match</div>' if b.get("douteux") else ""
+        lignes_but.append(
+            f'<div class="carte"><div class="sel">{e(b["joueur"])}</div><div class="droite cote">{fr(b["cote_min"] * 1.1)}</div>'
+            f'<div class="qui">{e(b["equipe"])} contre {e(b["adv"])}, {quand_court(b["start"])}</div>'
+            f'<div class="droite mini">cote mini</div>'
+            f'<div class="bas">{donut(b["p"], taille=44, ep=6, label=f"Chance de marquer {pc(b["p"])}")}'
+            f'<div class="txt"><b>{pc(b["p"])}</b> de chance de marquer, {b["buts"]} buts en {b["mj"]} matchs{inc}</div>'
+            f'{bouton_pick(item)}</div></div>')
+    but = (titre("Buteurs", "Chance de marquer s'il est titulaire. La cote buteur se vérifie sur Betclic.")
+           + '<div class="liste">' + "".join(lignes_but) + "</div>") if lignes_but else vide("Pas de données buteurs cette semaine.")
+
+    ldc_m = sorted([m for m in matchs_f if m["comp"] == "Ligue des Champions"], key=lambda m: m["start"])
+    autres = sorted([m for m in matchs_f if m["comp"] != "Ligue des Champions"], key=lambda m: m["start"])
+    onglets = [("jouer", "À jouer", len(a_jouer), jouer), ("buts", "Buts", len(lignes_buts), buts),
+               ("combines", "Combinés", n_comb, combines)]
+    if ldc_m:
+        onglets.append(("ldc", "Ligue des Champions", len(ldc_m),
+                        (bloc_combines(ldc_g) if ldc_g else "") + titre("Les matchs") + "".join(fiche_match(m) for m in ldc_m)))
+    onglets += [("buteurs", "Buteurs", len(buteurs), but),
+                ("matchs", "Matchs", len(autres), (titre("Championnats", "Forme, bilan de la saison et cotes à cocher.")
+                                                   + "".join(fiche_match(m) for m in autres)) if autres else vide("Aucun match."))]
+    if matchs_b:
+        bv = [o for o in a_jouer if o["cat"] == "BASKET"]
+        onglets.append(("basket", "Basket", len(matchs_b),
+                        ((titre("Paris basket à jouer") + '<div class="liste">' + "".join(ligne_pari(o) for o in bv) + "</div>")
+                         if bv else "") + titre("Matchs NBA et EuroLeague")
+                        + "".join(fiche_match(m) for m in sorted(matchs_b, key=lambda m: m["start"]))))
+
+    rail = "".join(f'<button class="onglet" type="button" role="tab" id="t-{i}" aria-controls="p-{i}" aria-selected="false" '
+                   f'data-onglet="{i}">{e(nom)}' + (f"<span>{n}</span>" if n else "") + "</button>"
+                   for i, nom, n, _ in onglets)
+    panneaux = "".join(f'<section role="tabpanel" id="p-{i}" aria-labelledby="t-{i}" data-panneau="{i}">{h}</section>'
+                       for i, _, _, h in onglets)
+    d0, d1 = now.astimezone(TZ), fin.astimezone(TZ)
+    semaine = (f"Du {d0.day} au {d1.day} {MOIS_FR[d1.month - 1]}" if d0.month == d1.month
+               else f"Du {d0.day} {MOIS_FR[d0.month - 1]} au {d1.day} {MOIS_FR[d1.month - 1]}")
+    maj = datetime.now(TZ)
+    ticket = (
+        '<div class="barre-ticket" id="barre-ticket" aria-hidden="true"><div class="in">'
+        '<div class="n"><span id="nb-ticket"></span><br><span style="opacity:.85;font-size:13px">ton ticket</span></div>'
+        '<div class="t" id="cote-ticket"></div><button type="button" id="voir-ticket">Voir le ticket</button></div></div>'
+        '<div class="voile" id="voile"></div>'
+        '<div class="feuille" id="feuille" role="dialog" aria-modal="true" aria-labelledby="titre-ticket" aria-hidden="true" tabindex="-1">'
+        '<div class="in"><div class="poignee"></div><div style="display:flex;justify-content:space-between;align-items:center">'
+        '<h2 id="titre-ticket">Ton ticket</h2><button type="button" class="btn texte" id="fermer-ticket">Fermer</button></div>'
+        '<p class="aide">Retrouve ces sélections sur Betclic. Les cotes ont pu bouger depuis le bilan.</p>'
+        '<div id="contenu-ticket"></div><div class="actions">'
+        '<button type="button" class="btn plein" id="copier-ticket">Copier la liste</button>'
+        '<a class="btn creux" href="https://www.betclic.fr/" target="_blank" rel="noopener">Ouvrir Betclic</a>'
+        '<button type="button" class="btn texte" id="vider-ticket">Vider le ticket</button></div></div></div>'
+        '<div class="info" id="info" role="status" aria-live="polite"></div>')
+    return (
+        '<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Mes paris</title>'
+        '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
+        '<meta name="apple-mobile-web-app-title" content="Mes paris"><meta name="theme-color" content="#FFFFFF">'
+        '<link rel="apple-touch-icon" href="apple-touch-icon.png"><link rel="icon" href="icon.png">'
+        '<link rel="manifest" href="manifest.json">'
+        '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@500;600;700&display=swap" rel="stylesheet">'
+        f'<style>{APPLI_CSS}</style></head>'
+        f'<body data-semaine="{now.astimezone(TZ):%Y%m%d%H%M}" data-jour="{d0:%d/%m}">'
+        f'<header class="page tete"><div class="marque"><i aria-hidden="true"></i><h1>Mes paris</h1></div>'
+        f'<div class="semaine">Matchs {semaine[0].lower()}{semaine[1:]}</div>'
+        f'<div class="maj">Mis à jour le {maj.day} {MOIS_FR[maj.month - 1]} à {maj:%H:%M}</div></header>'
+        f'<div class="page"><!--COMPOS--></div>'
+        f'<nav class="onglets" aria-label="Types de paris"><div class="rail" role="tablist">{rail}</div></nav>'
+        f'<main class="page">{panneaux}<p class="pied">Ces chiffres sont des estimations : même un bon pari perd souvent. '
+        f"Ne mise que ce que tu peux perdre. Besoin d'aide : Joueurs Info Service, 09 74 75 13 13.</p></main>"
+        f'{ticket}<script>{APPLI_JS}</script></body></html>')
 
 
 # =============================================================================
@@ -2114,6 +2907,302 @@ def envoyer_email(contenu_html: str, sujet: str, pdf: Path | None) -> None:
 
 
 # =============================================================================
+# MODE AVANT-MATCH : contrôle léger les jours de match (compos officielles, blessures du jour)
+# =============================================================================
+F_CONSEILS = "conseils.json"          # écrit par le bilan, lu par le contrôle avant-match
+F_STATUTS = "statuts_matchs.json"     # ce que les contrôles ont déjà vu
+F_ALERTES = "alertes_envoyees.json"   # pour ne jamais envoyer deux fois la même alerte
+FENETRE_COMPO_MIN = 75                # on cherche la compo dans les 75 minutes avant le coup d'envoi
+FENETRE_BLESSURES_H = 48              # blessures vérifiées une fois par jour pour les matchs des 48 h à venir
+
+
+def _lire_json(nom, defaut):
+    try:
+        return json.loads((CACHE_DIR / nom).read_text(encoding="utf-8"))
+    except Exception:
+        return defaut
+
+
+def _ecrire_json(nom, data):
+    CACHE_DIR.mkdir(exist_ok=True)
+    (CACHE_DIR / nom).write_text(json.dumps(data, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+
+
+def sauver_conseils(matchs_f, syn, now):
+    """Mémorise ce que le bilan a conseillé, pour que le contrôle avant-match sache quoi surveiller."""
+    comp_id = {c["nom"]: c["id"] for c in COMPETITIONS}
+    matchs = {}
+    for m in matchs_f:
+        matchs[str(m["id"])] = {"home": m["home"], "away": m["away"], "start": m["start"].isoformat(),
+                                "comp": m["comp"], "comp_id": comp_id.get(m["comp"]),
+                                "fixture_id": m.get("fixture_id"), "cles": m.get("cles", {"home": [], "away": []}),
+                                "absents_connus": [x["nom"] for x in m.get("absents", [])]}
+    conseils = []
+
+    def ajoute(o, type_, groupe):
+        if str(o["match_id"]) in matchs:
+            conseils.append({"match_id": str(o["match_id"]), "libelle": o["libelle"], "cote": o["cote"],
+                             "type": type_, "groupe": groupe})
+    for o in syn["a_jouer"]:
+        ajoute(o, "simple", "Paris à jouer")
+    for x in syn["buts"]:
+        if x["choix"]["opt"]:
+            ajoute(x["choix"]["opt"], "buts", "Nombre de buts")
+    for titre, _, combos in groupes_combines(syn["comb"]):
+        for i, c in enumerate(combos, 1):
+            if titre.startswith("Spécial"):
+                nom = f"LDC : {c.get('nom') or titre}"
+            elif titre.startswith("Combiné global"):
+                nom = "Combiné global"
+            else:
+                nom = f"{titre} n°{i}"
+            for o in c["legs"]:
+                ajoute(o, "combine", nom)
+    for b in syn["buteurs"][:12]:
+        mid = next((k for k, v in matchs.items() if f'{v["home"]} – {v["away"]}' == b["match"]), None)
+        if mid:
+            conseils.append({"match_id": mid, "libelle": f'{b["joueur"]} buteur', "cote": None, "type": "buteur",
+                             "groupe": "Buteurs", "joueur": b["joueur"], "equipe": b["equipe"]})
+    _ecrire_json(F_CONSEILS, {"cree": now.isoformat(), "matchs": matchs, "conseils": conseils})
+    _ecrire_json(F_STATUTS, {})                 # nouvelle semaine : on repart de zéro
+    _ecrire_json(F_ALERTES, [])
+
+
+def conseils_touches(conseils, mid, joueur, cote_eq, info):
+    """Les conseils d'un match qu'une absence fragilise : sa victoire, les « plus de » buts, le joueur buteur."""
+    equipe = info[cote_eq]
+    out = []
+    for c in conseils:
+        if c["match_id"] != mid:
+            continue
+        if c["type"] == "buteur":
+            if meme_joueur(c["joueur"], joueur):
+                out.append(c)
+        elif c["libelle"].startswith("Victoire ") and match_team(c["libelle"][len("Victoire "):], [equipe]):
+            out.append(c)
+        elif c["libelle"].startswith("Plus de"):
+            out.append(c)
+    return out
+
+
+def cote_actuelle(ev, libelle):
+    """La cote Betclic actuelle d'une sélection, dans un événement The Odds API déjà lu."""
+    if ev is None:
+        return None
+    bc = ev["betclic"]
+    if libelle == "Match nul":
+        return bc["h2h"].get("D")
+    if libelle.startswith("Victoire "):
+        nom = libelle[len("Victoire "):]
+        return bc["h2h"].get("H") if nom == ev["home"] else bc["h2h"].get("A") if nom == ev["away"] else None
+    mo = re.match(r"(Plus|Moins) de ([0-9,]+) ", libelle)
+    if mo:
+        ligne = float(mo.group(2).replace(",", "."))
+        return bc["totals"].get(ligne, {}).get("Over" if mo.group(1) == "Plus" else "Under")
+    return None
+
+
+def bandeau_compos(statuts, matchs, now):
+    """Encadré « Compos et absences » placé en haut de la page téléphone."""
+    lignes = []
+    for mid, st in sorted(statuts.items(), key=lambda kv: matchs.get(kv[0], {}).get("start", "")):
+        info = matchs.get(mid)
+        if not info or not (st.get("compo") or st.get("absents_nouveaux")):
+            continue
+        debut = datetime.fromisoformat(info["start"])
+        if debut < now - timedelta(hours=3):
+            continue
+        txt = []
+        for x in st.get("absents_nouveaux", []):
+            txt.append(f'<span style="color:#C1121F;font-weight:600">Absent : {e(x)}</span>')
+        compo = st.get("compo") or {}
+        for cote in ("home", "away"):
+            for j in compo.get(cote, []):
+                if j["etat"] != "titulaire":
+                    txt.append(f'<span style="color:#C1121F;font-weight:600">{e(j["nom"])} {e(j["etat"])}</span>')
+        if compo and not any(j["etat"] != "titulaire" for c in ("home", "away") for j in compo.get(c, [])):
+            txt.append('<span style="color:#18181B">Compo officielle : tous les joueurs clés sont titulaires</span>')
+        lignes.append(f'<div style="padding:10px 0;border-top:1px solid #E4E4E7">'
+                      f'<div style="font-size:13px;color:#52525B">{e(info["home"])} – {e(info["away"])}, {heure(debut)}</div>'
+                      f'<div style="font-size:15px;margin-top:3px">{" · ".join(txt)}</div></div>')
+    if not lignes:
+        return ""
+    return (f'<div style="border:1px solid #E4E4E7;border-left:4px solid #C1121F;border-radius:12px;padding:12px 16px 6px;'
+            f'margin:0 0 16px;background:#fff">'
+            f'<div style="font:700 20px/1.2 \'Barlow Semi Condensed\',\'Arial Narrow\',sans-serif">Compos et absences</div>'
+            f'<div style="font-size:13px;color:#52525B;margin-bottom:8px">Mis à jour le {datetime.now(TZ):%d/%m à %H:%M}</div>'
+            + "".join(lignes) + "</div>")
+
+
+def email_alertes(alertes) -> str:
+    cartes = []
+    for a in alertes:
+        touches = "".join(
+            f'<li style="margin:4px 0"><b>{e(c["libelle"])}</b> <span style="color:#5f6b7a">({e(c["groupe"])})</span>'
+            + (f' · cote actuelle <b>{fr(c["cote_actuelle"])}</b>' if c.get("cote_actuelle") else "") + "</li>"
+            for c in a["touches"])
+        cartes.append(
+            f'<div style="border:1px solid #e3e7ec;border-radius:12px;padding:16px;margin:12px 0;background:#fff">'
+            f'<div style="font-size:14px;color:#5f6b7a">{e(a["match"])} · {e(a["quand"])}</div>'
+            f'<div style="font-size:20px;font-weight:800;color:#b42318;margin:4px 0">{e(a["titre"])}</div>'
+            + (f'<div style="font-size:15px;margin-top:6px">Tes conseils touchés :</div><ul style="font-size:15px;padding-left:20px;margin:6px 0">{touches}</ul>'
+               if touches else '<div style="font-size:15px;margin-top:6px">Aucun de tes conseils n\'est directement touché.</div>')
+            + "</div>")
+    return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+            f'<body style="margin:0;background:#f5f7fa;font-family:-apple-system,\'Segoe UI\',Roboto,Arial,sans-serif;color:#1f2328">'
+            f'<div style="max-width:600px;margin:0 auto;padding:20px 14px">'
+            f'<div style="font-size:26px;font-weight:800">Changement avant match</div>'
+            f'<div style="font-size:15px;color:#5f6b7a;margin-top:4px">Vérifie tes paris avant le coup d\'envoi.</div>'
+            + "".join(cartes)
+            + '<div style="font-size:13px;color:#5f6b7a;margin-top:20px">Ne mise que ce que tu peux perdre. '
+              'Joueurs Info Service : 09 74 75 13 13.</div></div></body></html>')
+
+
+def avant_match(now, dry_run=False):
+    data = _lire_json(F_CONSEILS, None)
+    if not data or not data.get("matchs"):
+        log("Aucun bilan enregistré : rien à surveiller (le prochain bilan créera la liste)")
+        return
+    echecs = []
+    api = APIFoot(echecs)
+    if not api.ok:
+        log("API_FOOTBALL_KEY absente : contrôle des compos impossible")
+        return
+    matchs, conseils = data["matchs"], data["conseils"]
+    statuts = _lire_json(F_STATUTS, {})
+    deja = set(_lire_json(F_ALERTES, []))
+    aujourd_hui = now.astimezone(TZ).strftime("%Y-%m-%d")
+    alertes, change = [], False
+    fpl = None
+
+    for mid, info in matchs.items():
+        debut = datetime.fromisoformat(info["start"])
+        reste_min = (debut - now).total_seconds() / 60
+        if reste_min < -10 or reste_min > FENETRE_BLESSURES_H * 60:
+            continue
+        st = statuts.setdefault(mid, {})
+        ligue = LIGUES_APIFOOT.get(info.get("comp_id"))
+        if not ligue:
+            continue
+        if not info.get("fixture_id"):
+            fx = api.trouver_match(ligue, info["home"], info["away"], debut, now)
+            if not fx:
+                continue
+            info["fixture_id"] = fx["fixture"]["id"]
+        match_txt, quand = f'{info["home"]} – {info["away"]}', heure(debut)
+        cles = info.get("cles") or {"home": [], "away": []}
+
+        def signaler(joueur, cote_eq, titre, cle):
+            if cle in deja:
+                return
+            deja.add(cle)
+            alertes.append({"match_id": mid, "match": match_txt, "quand": quand, "titre": titre,
+                            "touches": conseils_touches(conseils, mid, joueur, cote_eq, info),
+                            "comp_id": info.get("comp_id")})
+
+        # 1) blessures et suspensions : une fois par jour, pour les matchs des 48 h à venir
+        if st.get("blessures_jour") != aujourd_hui:
+            st["blessures_jour"], change = aujourd_hui, True
+            absents = []
+            for b in api.blessures(ligue, debut.astimezone(timezone.utc).strftime("%Y-%m-%d"), now):
+                if (b.get("fixture") or {}).get("id") == info["fixture_id"] and b["player"].get("type") == "Missing Fixture":
+                    cote_eq = "home" if match_team(info["home"], [b["team"]["name"]]) else "away"
+                    absents.append((b["player"]["name"], cote_eq, b["player"].get("reason") or "absent"))
+            if info.get("comp_id") == "soccer_epl":
+                fpl = fpl if fpl is not None else fpl_joueurs()
+                if fpl is not None:
+                    for cote_eq in ("home", "away"):
+                        t = match_team(info[cote_eq], fpl["team"].unique().tolist())
+                        for r in (fpl[fpl["team"] == t].itertuples() if t else []):
+                            ch = None if pd.isna(r.chance) else int(r.chance)
+                            if r.statut in ("i", "s", "u") or (ch is not None and ch <= 25):
+                                absents.append((f"{r.joueur} / {r.court}" if r.court else r.joueur, cote_eq,
+                                                r.news or "absent"))
+            for nom, cote_eq, raison in absents:
+                if dans_liste(nom, cles.get(cote_eq, [])) and not dans_liste(nom, info.get("absents_connus", [])):
+                    st.setdefault("absents_nouveaux", [])
+                    if not dans_liste(nom, st["absents_nouveaux"]):
+                        st["absents_nouveaux"].append(nom_affiche(nom))
+                    signaler(nom, cote_eq, f"{nom_affiche(nom)} ({info[cote_eq]}) absent : {raison}",
+                             f"{mid}|{norm(nom_affiche(nom))}|absent")
+
+        # 2) compo officielle : dans les 75 minutes avant le coup d'envoi
+        if -10 <= reste_min <= FENETRE_COMPO_MIN and not st.get("compo"):
+            lu = api.compos(info["fixture_id"])
+            if len(lu) >= 2:
+                compo = {}
+                for equipe in lu:
+                    cote_eq = "home" if match_team(info["home"], [equipe["team"]["name"]]) else "away"
+                    xi = [p["player"]["name"] for p in equipe.get("startXI", [])]
+                    rempl = [p["player"]["name"] for p in equipe.get("substitutes", [])]
+                    compo[cote_eq] = []
+                    etats = [("titulaire" if dans_liste(nom, xi) else "remplaçant" if dans_liste(nom, rempl)
+                              else "absent du groupe") for nom in cles.get(cote_eq, [])]
+                    # garde-fou : aucun joueur clé reconnu dans toute la feuille de match = noms mal reconnus,
+                    # pas une hécatombe ; on n'alerte pas sur une erreur de lecture
+                    noms_ok = len(xi) >= 11 and any(x != "absent du groupe" for x in etats) or len(etats) == 0
+                    if not noms_ok and len(xi) >= 11:
+                        log(f"   {info[cote_eq]} : joueurs clés introuvables dans la compo (noms ?), pas d'alerte")
+                        st["noms_non_reconnus"] = True
+                    for nom, etat in zip(cles.get(cote_eq, []), etats):
+                        compo[cote_eq].append({"nom": nom_affiche(nom), "etat": etat})
+                        if etat != "titulaire" and (noms_ok or etat == "remplaçant"):
+                            signaler(nom, cote_eq, f"{nom_affiche(nom)} ({info[cote_eq]}) {etat}",
+                                     f"{mid}|{norm(nom_affiche(nom))}|{etat}")
+                st["compo"], change = compo, True
+                log(f"   Compo reçue : {match_txt}")
+            else:
+                log(f"   Compo pas encore publiée : {match_txt}")
+
+    # 3) cotes actuelles des conseils touchés (2 crédits par championnat, seulement s'il y a une alerte)
+    if alertes and ODDS_API_KEY:
+        src = SourcesReelles(use_llm=False)
+        evs = {}
+        for cid in {a["comp_id"] for a in alertes if a.get("comp_id")}:
+            comp = next((c for c in COMPETITIONS if c["id"] == cid), None)
+            for ev in (src.cotes(comp) if comp else []):
+                evs[str(ev["id"])] = ev
+        for a in alertes:
+            for c in a["touches"]:
+                if c["type"] != "buteur":
+                    c["cote_actuelle"] = cote_actuelle(evs.get(a["match_id"]), c["libelle"])
+
+    data["matchs"] = matchs
+    _ecrire_json(F_CONSEILS, data)
+    _ecrire_json(F_STATUTS, statuts)
+    _ecrire_json(F_ALERTES, sorted(deja))
+    log(f"Contrôle terminé : {len(alertes)} nouvelle(s) alerte(s), {api._compteur()} requête(s) API-Football aujourd'hui")
+    for x in echecs:
+        log(f"   {x}")
+
+    # page téléphone : le bilan de la semaine + l'encadré des compos, seulement s'il y a du nouveau
+    page_dir, base = os.environ.get("PAGE_DIR"), CACHE_DIR / "site_base"
+    if page_dir and change and (base / "index.html").exists():
+        import shutil
+        d = Path(page_dir)
+        if d.exists():
+            shutil.rmtree(d)
+        shutil.copytree(base, d)
+        index = (d / "index.html").read_text(encoding="utf-8")
+        (d / "index.html").write_text(index.replace("<!--COMPOS-->", bandeau_compos(statuts, matchs, now), 1),
+                                      encoding="utf-8")
+        log("   Page téléphone mise à jour")
+
+    if not alertes:
+        return
+    OUT_DIR.mkdir(exist_ok=True)
+    html_mail = email_alertes(alertes)
+    (OUT_DIR / f"alerte_{now.astimezone(TZ):%Y%m%d_%H%M}.html").write_text(html_mail, encoding="utf-8")
+    if dry_run or not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        log("Alerte écrite dans rapports/ (pas d'envoi : --dry-run ou identifiants Gmail absents)")
+        return
+    sujet = "Compo : " + alertes[0]["titre"] + (f" (+{len(alertes) - 1} autre(s))" if len(alertes) > 1 else "")
+    envoyer_email(html_mail, sujet[:150], None)
+    log("E-mail d'alerte envoyé")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
@@ -2121,9 +3210,14 @@ def main():
     ap.add_argument("--demo", action="store_true", help="données simulées, hors ligne, sans e-mail")
     ap.add_argument("--dry-run", action="store_true", help="vraies données, sans e-mail")
     ap.add_argument("--no-llm", action="store_true", help="désactive les actus Gemini")
+    ap.add_argument("--avant-match", action="store_true",
+                    help="contrôle léger : compos officielles et blessures des matchs conseillés")
     ap.add_argument("--jours", type=float, default=float((os.environ.get("FENETRE_JOURS") or "4.5").replace(",", ".")))
     args = ap.parse_args()
 
+    if args.avant_match:
+        avant_match(datetime.now(timezone.utc), dry_run=args.dry_run)
+        return
     src = SourcesDemo() if args.demo else SourcesReelles(use_llm=not args.no_llm)
     now = src.now if args.demo else datetime.now(timezone.utc)
     fin = now + timedelta(days=args.jours)
@@ -2157,6 +3251,14 @@ def main():
         (matchs_f if comp["cat"] == "FOOT" else matchs_b).extend(res)
         log(f"   {comp['nom']} : ok")
 
+    if matchs_f and not args.demo:
+        log("   Effectifs : blessures, suspensions et joueurs clés (API-Football, Fantasy Premier League)")
+        try:
+            enrichir_effectifs(matchs_f, src, now)
+        except Exception as ex:
+            log(f"   Effectifs indisponibles ({ex})")
+            src.echecs.append(f"Effectifs : {ex}")
+
     log("3/4 Actus blessés (facultatif, matchs à sélection intéressante seulement)")
     def interet(m):
         return max([o["edge"] + (0.05 if o["p"] >= 0.6 else 0) for o in m["options"]] or [-1])
@@ -2176,6 +3278,8 @@ def main():
     base = "demo" if args.demo else f"{now.astimezone(TZ):%Y%m%d_%H%M}"
     (OUT_DIR / f"rapport_{base}.html").write_text(page, encoding="utf-8")
     syn = synthese(matchs_f, matchs_b)
+    if not args.demo:
+        sauver_conseils(matchs_f, syn, now)
     pdf = OUT_DIR / f"Bilan_Betclic_{now.astimezone(TZ):%d-%m-%Y}{'_demo' if args.demo else ''}.pdf"
     pdf_ok = generer_pdf(pdf, matchs_f, matchs_b, syn, src, now, fin)
     mail = generer_email(matchs_f, matchs_b, syn, src, now, fin, avec_pdf=pdf_ok)
@@ -2191,6 +3295,11 @@ def main():
         if pdf_ok:
             shutil.copy(pdf, d / "bilan.pdf")
         ecrire_icone(d)
+        if not args.demo:                       # repris par les contrôles avant-match de la semaine
+            base_site = CACHE_DIR / "site_base"
+            if base_site.exists():
+                shutil.rmtree(base_site)
+            shutil.copytree(d, base_site)
         log(f"   Page téléphone écrite dans : {d.resolve()}")
     log(f"   Fichiers écrits dans : {OUT_DIR.resolve()}")
     log(f"   PDF : {pdf.name if pdf_ok else 'non généré'}  ·  aperçu du mail : email_{base}.html")
